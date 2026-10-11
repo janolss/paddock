@@ -37,7 +37,7 @@ impl Gemma4 {
             // Bounded four-image encoder wave, casts and cached features.
             .saturating_add(1 << 30)
             .saturating_add(64 << 20);
-        diffusion_residency::admit(required, source.bytes(), budget)?;
+        diffusion_residency::admit(required, budget)?;
         let device = MetalDevice::new_planned(budget, required)?;
         let packed = |name: &str, k, n| {
             source.packed(

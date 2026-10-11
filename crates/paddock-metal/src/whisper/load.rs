@@ -93,7 +93,6 @@ impl Whisper {
                 .ok_or_else(|| error("missing language map"))?,
         )?;
         let schema = schema(map.tensor_info("proj_out.weight").is_some());
-        let mut source_bytes = 0u64;
         if map.gguf().tensors.len() != schema.len() {
             return Err(error("unexpected tensor inventory"));
         }
@@ -110,18 +109,15 @@ impl Whisper {
             {
                 return Err(error(format!("{name}: nonfinite weight")));
             }
-            source_bytes += b.len() as u64;
         }
         let ctx = context.min(448);
+        // residency_bytes already includes the weight copy. The GGUF mapping is
+        // file cache and is already counted as reclaimable by the host sample.
         let required = Self::residency_bytes(&map, ctx, slots)?;
         let host = paddock_engine::host_memory::sample()
             .ok_or_else(|| MetalError::Memory("cannot read physical memory availability".into()))?;
         let available = host.available.saturating_sub(1 << 30);
         paddock_engine::host_memory::check(required, available, budget)
-            .map_err(MetalError::Memory)?;
-        // The mapped checkpoint and GPU copy coexist while loading. Do not
-        // pretend unified memory provides an independent host and VRAM pool.
-        paddock_engine::host_memory::check(required + source_bytes, available, None)
             .map_err(MetalError::Memory)?;
         let device = MetalDevice::new_planned(budget, required)?;
         let conv1 = linear(&device, &map, "encoder.conv1", 3 * 128, D)?;

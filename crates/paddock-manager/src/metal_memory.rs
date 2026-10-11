@@ -116,10 +116,17 @@ pub fn sample() -> Option<Snapshot> {
         page as u64,
         physical,
     );
+    // Same ceiling as MetalDevice::planned_budget: Apple's working set minus
+    // 2 GiB for driver/compiler/transient work outside the buffer ledger.
+    // Do not shave another percentage of recommendedMaxWorkingSetSize; that
+    // value is already Apple's performance line. HEADROOM stays on `available`
+    // only (VM-sample uncertainty), never as a second cut of the GPU cap.
+    let recommended = device.recommendedMaxWorkingSetSize();
     Some(Snapshot {
         name: device.name().to_string(),
         physical,
-        limit: (device.recommendedMaxWorkingSetSize() * 9 / 10)
+        limit: recommended
+            .saturating_sub(2 << 30)
             .min(physical.saturating_sub(HEADROOM)),
         available,
     })
@@ -130,25 +137,23 @@ pub fn sample() -> Option<Snapshot> {
     None
 }
 
-/// Reservations already backed by a live allocation must not be subtracted
-/// from the OS's available-memory sample a second time. Reserve only their unused
-/// headroom there, while the fleet ceiling counts the entire commitment.
+/// Two independent limits apply and the tighter one wins.
+/// - GPU cap: `limit` is shared by every runner, and live allocations consume
+///   it, so the whole device reservation is charged against it.
+/// - RAM: live allocations are already absent from `available`, so only the
+///   unallocated part of the reservation and the host RAM caches are charged.
 pub fn residual(
     snapshot: &Snapshot,
     device_reserved: u64,
     device_used: u64,
     host_reserved: u64,
 ) -> u64 {
-    snapshot
-        .limit
-        .saturating_sub(device_reserved)
-        .saturating_sub(host_reserved)
-        .min(
-            snapshot
-                .available
-                .saturating_sub(device_reserved.saturating_sub(device_used))
-                .saturating_sub(host_reserved),
-        )
+    let gpu_room = snapshot.limit.saturating_sub(device_reserved);
+    let ram_room = snapshot
+        .available
+        .saturating_sub(device_reserved.saturating_sub(device_used))
+        .saturating_sub(host_reserved);
+    gpu_room.min(ram_room)
 }
 
 pub async fn available(state: &AppState, freeing: Option<u16>) -> Option<(Snapshot, u64)> {
@@ -215,6 +220,15 @@ pub async fn available(state: &AppState, freeing: Option<u16>) -> Option<(Snapsh
                 matches,
             )
         });
+        tracing::debug!(
+            port,
+            reservation = budget,
+            live,
+            dynamic = dynamic.is_some(),
+            baseline_matches = matches,
+            fell_back_to_limit = dynamic.is_none() && budget == snapshot.limit,
+            "Metal memory: runner reservation"
+        );
         reserved = reserved.saturating_add(budget.max(live));
         used = used.saturating_add(live);
         if let Ok(spec) = state
@@ -226,6 +240,21 @@ pub async fn available(state: &AppState, freeing: Option<u16>) -> Option<(Snapsh
         }
     }
     let free = residual(&snapshot, reserved, used, host);
+    tracing::debug!(
+        limit = snapshot.limit,
+        physical = snapshot.physical,
+        available = snapshot.available,
+        reserved,
+        used,
+        host,
+        gpu_room = snapshot.limit.saturating_sub(reserved),
+        ram_room = snapshot
+            .available
+            .saturating_sub(reserved.saturating_sub(used))
+            .saturating_sub(host),
+        free,
+        "Metal memory: residual"
+    );
     Some((snapshot, free))
 }
 
@@ -339,6 +368,19 @@ mod tests {
         assert_eq!(residual(&s, 40, 30, 15), 35);
         assert_eq!(residual(&s, 100, 30, 0), 0);
         assert_eq!(residual(&s, 10, 10, 100), 0);
+        // 10 GiB live is already missing from `available`, but still consumes
+        // the shared GPU cap, so the cap binds (22 - 10), not `available`.
+        let mac = Snapshot {
+            name: "test".into(),
+            physical: 32 << 30,
+            limit: 22 << 30,
+            available: 21 << 30,
+        };
+        assert_eq!(residual(&mac, 10 << 30, 10 << 30, 0), 12 << 30);
+        // Host RAM caches lower RAM room but never the GPU cap.
+        assert_eq!(residual(&mac, 0, 0, 15 << 30), 6 << 30);
+        // Unallocated reservation counts against both limits.
+        assert_eq!(residual(&mac, 10 << 30, 4 << 30, 0), 12 << 30);
         assert_eq!(reservation(&s, Some(1), true), 1 << 20);
         assert_eq!(reservation(&s, Some(1), false), s.limit);
         assert_eq!(reservation(&s, None, true), s.limit);
@@ -346,7 +388,17 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn apple_silicon_reports_real_memory() {
+        use objc2_metal::MTLDevice;
         let s = sample().unwrap();
+        let recommended = objc2_metal::MTLCreateSystemDefaultDevice()
+            .expect("Metal device")
+            .recommendedMaxWorkingSetSize();
         assert!(s.physical > 1 << 30 && s.limit <= s.physical && s.available <= s.physical);
+        assert_eq!(
+            s.limit,
+            recommended
+                .saturating_sub(2 << 30)
+                .min(s.physical.saturating_sub(HEADROOM))
+        );
     }
 }

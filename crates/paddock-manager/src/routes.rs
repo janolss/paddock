@@ -1673,7 +1673,16 @@ async fn metal_admission(
         })?;
     let host = req.offload_ram_bytes.unwrap_or(0);
     let free = free.saturating_sub(host);
-    if req.fixed_need.is_some_and(|need| need > free) {
+    if let Some(need) = req.fixed_need
+        && need > free
+    {
+        tracing::warn!(
+            model = %req.model,
+            reason = "configured_budget_exceeds_free",
+            needed = need,
+            free,
+            "Metal admission refused a spawn"
+        );
         return Err(refuse(format!(
             "The configured memory budget exceeds the {:.1} GiB available after other models and RAM caches. Lower the budget or stop another instance.",
             free as f64 / (1u64 << 30) as f64
@@ -1750,16 +1759,49 @@ async fn metal_admission(
         let priced = at(ctx);
         *shape = priced;
         let estimate = crate::estimate::backend_estimate("metal", shape, &env, &device);
-        if matches!(estimate.fit, paddock_estimator::Fit::DoesNotFit { .. })
-            || (shape.kind == paddock_estimator::ModelKind::Generative
-                && estimate.max_ctx < shape.max_ctx)
-        {
+        let needed = (estimate.resident + estimate.kv_pool).max(shape.weight_bytes + (1 << 30));
+        tracing::debug!(
+            model = %req.model,
+            ctx = shape.max_ctx,
+            concurrency = env.concurrency,
+            weights = estimate.weights,
+            workspace = estimate.workspace,
+            state = estimate.state,
+            overhead = estimate.overhead,
+            allocator_slack = estimate.overhead_parts.allocator_slack,
+            logits = estimate.overhead_parts.logits,
+            block_tables = estimate.overhead_parts.block_tables,
+            resident = estimate.resident,
+            kv_pool = estimate.kv_pool,
+            needed,
+            "Metal admission estimate"
+        );
+        let short_ctx = shape.kind == paddock_estimator::ModelKind::Generative
+            && estimate.max_ctx < shape.max_ctx;
+        if matches!(estimate.fit, paddock_estimator::Fit::DoesNotFit { .. }) || short_ctx {
+            let reason = if matches!(estimate.fit, paddock_estimator::Fit::DoesNotFit { .. }) {
+                "resident_exceeds_free"
+            } else {
+                "context_does_not_fit"
+            };
+            tracing::warn!(
+                model = %req.model,
+                reason,
+                needed,
+                free,
+                resident = estimate.resident,
+                kv_pool = estimate.kv_pool,
+                requested_ctx = shape.max_ctx,
+                fitted_ctx = estimate.max_ctx,
+                concurrency = env.concurrency,
+                "Metal admission refused a spawn"
+            );
             return Err(refuse(format!(
                 "This model does not fit the available unified-memory budget at {} tokens and {} concurrent requests. Lower context/concurrency or stop another instance.",
                 shape.max_ctx, env.concurrency
             )));
         }
-        (estimate.resident + estimate.kv_pool).max(shape.weight_bytes + (1 << 30))
+        needed
     } else {
         // Unknown/imported layouts get a real hard ceiling, never an unbounded
         // load. The runner validates the layout inside that reserved budget.
@@ -1772,7 +1814,15 @@ async fn metal_admission(
                         .into(),
                 )
             })?;
-        if weights.saturating_add(3 << 30) > ceiling {
+        let needed = weights.saturating_add(3 << 30);
+        if needed > ceiling {
+            tracing::warn!(
+                model = %req.model,
+                reason = "weights_exceed_free",
+                needed,
+                free,
+                "Metal admission refused a spawn"
+            );
             return Err(refuse(
                 "The checkpoint weights and runtime allowance exceed available unified memory."
                     .into(),
@@ -1781,8 +1831,21 @@ async fn metal_admission(
         ceiling
     };
     if required > ceiling || ceiling < 1 << 20 {
+        tracing::warn!(
+            model = %req.model,
+            reason = "required_exceeds_free",
+            needed = required,
+            free,
+            "Metal admission refused a spawn"
+        );
         return Err(refuse("Insufficient unified memory for this model.".into()));
     }
+    tracing::info!(
+        model = %req.model,
+        needed = required,
+        free,
+        "Metal admission"
+    );
     Ok(Admitted {
         grant: req
             .fixed_need

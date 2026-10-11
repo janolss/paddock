@@ -165,7 +165,7 @@ impl Gemma4 {
                 .saturating_add(kv_bytes)
                 .saturating_add(scratch_bytes)
                 .saturating_add(64 << 20);
-            diffusion_residency::admit(required, map.total_len(), budget)?;
+            diffusion_residency::admit(required, budget)?;
             MetalDevice::new_planned(budget, required)?
         } else {
             MetalDevice::new(budget)?
