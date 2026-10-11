@@ -135,6 +135,108 @@ fn flash_next_mlx_teacher_forced_margins() {
 }
 
 #[test]
+#[ignore = "111 GB captured-agent GPU logit diagnostic; external memory watchdog required"]
+fn flash_next_mlx_agent_rendered_margins() {
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let capture: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_RENDERED_REPLAY").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(capture["complete"], true);
+    let index: usize =
+        std::env::var("PADDOCK_FLASH_NEXT_RENDERED_CASE").map_or(3, |v| v.parse().unwrap());
+    let case = &capture["cases"][index];
+    let native = capture["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["engine"] == "paddock-off" && r["case"] == index)
+        .unwrap();
+    let dump = &native["native_dump"];
+    assert_eq!(dump["prompt"], case["ids"]);
+    assert_eq!(dump["finish"], "Stop");
+    let ids = |v: &serde_json::Value| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|t| u32::try_from(t.as_u64().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let prompt = ids(&case["ids"]);
+    let continuation = ids(&dump["generated"]);
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(Path::new(&path).join("generation_config.json")).unwrap(),
+    )
+    .unwrap();
+    let eos = if config["eos_token_id"].is_array() {
+        ids(&config["eos_token_id"])
+    } else {
+        vec![u32::try_from(config["eos_token_id"].as_u64().unwrap()).unwrap()]
+    };
+    assert!(!prompt.is_empty() && !continuation.is_empty() && !eos.is_empty());
+    assert!(prompt.len() + continuation.len() < 32768);
+    assert!(
+        prompt
+            .iter()
+            .chain(&continuation)
+            .chain(&eos)
+            .all(|&t| (t as usize) < VOCAB)
+    );
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .map(|v| v.parse::<u64>().unwrap())
+        .ok();
+    let mut m = FlashNext::load(Path::new(&path), 32768, 1, budget).unwrap();
+    m.prefill(0, &prompt).unwrap();
+    let allocated = m.device.allocated_bytes();
+    let mut records = Vec::new();
+    let mut matches = true;
+    for step in 0..=continuation.len() {
+        let teachers = eos.iter().chain(continuation.get(step));
+        let mut selections = Vec::new();
+        let mut top_ids = Vec::new();
+        for &teacher in teachers {
+            let cmd = m.device.begin().unwrap();
+            cmd.dispatch(
+                "q4b_margin",
+                &[&m.scratch.logits, &m.scratch.ids, &m.scratch.delta],
+                &[VOCAB as u32, teacher],
+                [1, 1, 1],
+                256,
+            );
+            cmd.finish().unwrap();
+            // Forward is complete; IDs and layer scratch are dead until the
+            // next walk. All reductions and teacher-score reads stay on GPU.
+            top_ids = unsafe { m.scratch.ids.read_u32(2) };
+            let values = unsafe { m.scratch.delta.read_f32(0, 3) };
+            assert!(values.iter().all(|v| v.is_finite()));
+            selections.push(serde_json::json!({"teacher_id":teacher, "values":values}));
+        }
+        matches &= continuation
+            .get(step)
+            .map_or_else(|| eos.contains(&top_ids[0]), |token| top_ids[0] == *token);
+        records.push(serde_json::json!({"step":step, "top_ids":top_ids,
+            "selections":selections}));
+        // Feed the captured history even after a mismatch; do not compare
+        // logits on different histories or call this a serving benchmark.
+        if let Some(&token) = continuation.get(step) {
+            m.forward(token).unwrap();
+        }
+        assert_eq!(m.device.allocated_bytes(), allocated);
+    }
+    eprintln!(
+        "FLASH_AGENT_MARGINS {}",
+        serde_json::json!({"case":index,
+        "prompt_ids":prompt, "continuation_ids":continuation, "eos_ids":eos,
+        "chunk":m.chunk, "capacity":m.capacity, "allocated_bytes":allocated,
+        "budget_bytes":budget, "captured_generation_matches":matches, "steps":records})
+    );
+    assert!(
+        matches,
+        "diagnostic must reproduce the captured native greedy reply"
+    );
+}
+
+#[test]
 #[ignore = "111 GB native MLX full-model GPU gate; run under external memory watchdog"]
 fn flash_next_mlx_full_generation_control() {
     let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
@@ -1121,8 +1223,8 @@ fn flash_next_mlx_admission_execution_cost() {
     let _prefix = std::mem::take(&mut m.prefix);
     let mut reference = None;
     for round in 0..2 {
-        for index in 0..3 {
-            let policy = (index + round) % 3;
+        for index in 0..4 {
+            let policy = (index + round) % 4;
             serving::POLICY_FOR_TEST.with(|v| v.set(policy));
             m.reset();
             for (slot, prompt) in prompts.iter().enumerate() {
@@ -1140,7 +1242,9 @@ fn flash_next_mlx_admission_execution_cost() {
                     .filter(|&s| (1..=16).contains(&steps[s]))
                     .map(|s| (s, 100 + s as u32 * 17 + steps[s], m.slots[s].length as u32))
                     .collect::<Vec<_>>();
-                let (out, complete) = m.forward_mixed(&decodes, m.chunk).unwrap();
+                let (out, complete) = m
+                    .forward_mixed(&decodes, m.prefill_tick_cap(decodes.len()))
+                    .unwrap();
                 gpu += m.last_gpu_seconds;
                 let elapsed = started.elapsed().as_secs_f64();
                 for (i, &(s, _, _)) in decodes.iter().enumerate() {
@@ -1331,6 +1435,116 @@ fn flash_next_mlx_fused_gate_up_execution_cost() {
                     "FLASH_FUSED_GATE_UP {}",
                     serde_json::json!({"slots":slots,"round":round,"fused":fused,
                     "gpu_seconds":gpu,"wall_seconds":started.elapsed().as_secs_f64(),"full_logits_exact":true})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; shared expert input, exact vocabularies and rotated GPU costs"]
+fn flash_next_mlx_shared_expert_input_execution_cost() {
+    expert_input_execution_cost(false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; hoisted routed addresses, exact vocabularies and rotated long-prompt GPU costs"]
+fn flash_next_mlx_hoisted_expert_input_execution_cost() {
+    expert_input_execution_cost(true);
+}
+
+fn expert_input_execution_cost(hoisted: bool) {
+    use super::super::moe;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            moe::SHARE_EXPERT_INPUT_FOR_TEST.with(|v| v.set(true));
+            moe::HOIST_EXPERT_INPUT_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let context = if hoisted { 16384 } else { 8192 };
+    let prompt = if hoisted { 8192 } else { 4096 };
+    let mut m = FlashNext::load(Path::new(&path), context, 4, Some(budget)).unwrap();
+    m.prefix.clear(&mut m.pool);
+    let _prefix = std::mem::take(&mut m.prefix);
+    let allocated = m.device.allocated_bytes();
+    for slots in [1, 4] {
+        let mut reference = None;
+        for round in 0..4 {
+            for index in 0..2 {
+                let shared = (round + index) % 2 == 1;
+                moe::SHARE_EXPERT_INPUT_FOR_TEST.with(|v| v.set(hoisted || shared));
+                moe::HOIST_EXPERT_INPUT_FOR_TEST.with(|v| v.set(!hoisted || shared));
+                m.reset();
+                let started = std::time::Instant::now();
+                let mut prompt_gpu = 0.;
+                let mut decode_gpu = 0.;
+                let mut logits = Vec::new();
+                // Unequal prompt lengths exercise both full matrix passes and
+                // mixed singleton/vector tails through the actual scheduler.
+                for slot in 0..slots {
+                    m.prefill_begin(
+                        slot,
+                        (0..prompt + slot * 17)
+                            .map(|p| 1000 + p as u32 + slot as u32 * 17)
+                            .collect(),
+                    )
+                    .unwrap();
+                }
+                let mut completed = vec![None; slots];
+                while !m.pending.is_empty() {
+                    let (_, done) = m.forward_mixed(&[], m.capacity).unwrap();
+                    prompt_gpu += m.last_gpu_seconds;
+                    for (slot, out, _) in done {
+                        completed[slot] =
+                            Some(out.into_iter().map(f32::to_bits).collect::<Vec<_>>());
+                    }
+                }
+                for out in completed {
+                    logits.extend(out.expect("every prompt must finish"));
+                }
+                for step in 0..32 {
+                    let rows = (0..slots)
+                        .map(|slot| {
+                            (
+                                slot,
+                                100 + step + slot as u32 * 17,
+                                m.slots[slot].length as u32,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    logits.extend(
+                        m.execute(&rows, &(0..slots).collect::<Vec<_>>())
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits),
+                    );
+                    decode_gpu += m.last_gpu_seconds;
+                }
+                if let Some(expected) = &reference {
+                    assert!(
+                        &logits == expected,
+                        "shared={shared} slots={slots} round={round}"
+                    );
+                } else {
+                    reference = Some(logits);
+                }
+                assert_eq!(allocated, m.device.allocated_bytes());
+                eprintln!(
+                    "FLASH_EXPERT_INPUT {}",
+                    serde_json::json!({
+                        "comparison": if hoisted { "hoisted_addresses" } else { "shared_conversion" },
+                        "slots": slots, "round": round, "shared": shared,
+                        "prefill_gpu_seconds": prompt_gpu, "decode_gpu_seconds": decode_gpu,
+                        "wall_seconds": started.elapsed().as_secs_f64(),
+                        "allocated_bytes": allocated, "full_logits_exact": true
+                    })
                 );
             }
         }

@@ -432,7 +432,7 @@ impl GpuNemotron {
         // bounces through x[0] and rewrites head_logits[0..vocab].
         let step = if dec_n > 0 {
             self.head_rows(dec_n)?;
-            self.sample_head_rows(dec_n, plans)?
+            self.sample_head_rows(dec_n, plans, true)?
         } else {
             SampledStep {
                 ids: Vec::new(),
@@ -446,7 +446,7 @@ impl GpuNemotron {
             let fs = match plan {
                 Some(p @ crate::generator::RowSample::Device(_)) => {
                     self.head_row_at(row)?;
-                    let s = self.sample_head_rows(1, std::slice::from_ref(&p))?;
+                    let s = self.sample_head_rows(1, std::slice::from_ref(&p), false)?;
                     FinishSample::Sampled(s.ids[0])
                 }
                 _ => FinishSample::Logits(self.head_row(row)?),

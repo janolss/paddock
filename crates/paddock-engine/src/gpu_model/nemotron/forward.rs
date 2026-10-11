@@ -1786,6 +1786,18 @@ impl Generator for GpuNemotron {
         self.device_trunc_supported()
     }
 
+    fn supports_stop_mask(&self) -> bool {
+        self.supports_device_sampling_impl() && self.exec.has_stop_mask_rows()
+    }
+
+    fn set_stop_masks(&mut self, masks: Vec<Option<crate::sampler::StopMask>>) {
+        self.stop.set(masks);
+    }
+
+    fn take_stop_pressure(&mut self) -> Vec<bool> {
+        self.stop.take(&self.exec)
+    }
+
     fn forward_batch_sampled(
         &mut self,
         tokens: &[u32],

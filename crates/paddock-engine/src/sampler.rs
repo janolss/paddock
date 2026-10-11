@@ -18,6 +18,9 @@
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 
+mod reasoning;
+pub use reasoning::{ReasoningStop, StopMask, pick_next, pick_verify_row, run_cut};
+
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
     /// 0.0 = greedy/argmax; >0 scales logits before softmax.
@@ -57,6 +60,11 @@ pub struct SamplingParams {
     /// ban would have masked - `repeat_stop_hit`. A degenerate loop is cut
     /// at its first repeated n-gram instead of steered into variations.
     pub no_repeat_ngram: (usize, usize, bool),
+    /// The reasoning-stop policy (`sampler/reasoning.rs`): while the reply's
+    /// reasoning block is open the model's own stop tokens do not end it. Set
+    /// by the runner when the rendered prompt opened a think block; None =
+    /// stops are final everywhere.
+    pub reasoning: Option<ReasoningStop>,
 }
 
 impl Default for SamplingParams {
@@ -73,6 +81,7 @@ impl Default for SamplingParams {
             seed: 0,
             logit_bias: Vec::new(),
             no_repeat_ngram: (0, 0, false),
+            reasoning: None,
         }
     }
 }
@@ -178,15 +187,19 @@ pub struct Sampler {
     // reused candidate buffer for the truncation paths - building a fresh
     // vocab-sized Vec per token is ~1.6 MB of alloc churn per slot per tick
     scratch: Vec<(u32, f32)>,
+    /// the reasoning-stop policy's state while the block is open
+    reasoning: Option<reasoning::Reasoning>,
 }
 
 impl Sampler {
     pub fn new(params: SamplingParams) -> Self {
         let rng = ChaCha8Rng::seed_from_u64(params.seed);
+        let reasoning = params.reasoning.as_ref().map(|_| Default::default());
         Self {
             params,
             rng,
             scratch: Vec::new(),
+            reasoning,
         }
     }
 
@@ -196,7 +209,8 @@ impl Sampler {
     /// computed before any host-side logit mutation could apply.
     pub fn is_pure_greedy(&self) -> bool {
         let p = &self.params;
-        p.temperature <= 0.0
+        !self.host_reasoning()
+            && p.temperature <= 0.0
             && p.logit_bias.is_empty()
             && !self.ngram_armed()
             && (p.repeat_last_n == 0
@@ -252,7 +266,8 @@ impl Sampler {
     /// `device_plan` itself consumes a uniform per Categorical plan.
     pub fn is_device_plannable(&self) -> bool {
         let p = &self.params;
-        self.is_spec_safe()
+        !self.host_reasoning()
+            && self.is_spec_safe()
             && (p.temperature <= 0.0 || (p.top_k == 0 && p.top_p >= 1.0 && p.min_p <= 0.0))
     }
 
@@ -261,7 +276,7 @@ impl Sampler {
     /// token's one uniform from the seed stream, exactly like the host draw
     /// would - call it once per token, and only when the plan will be used.
     pub fn device_plan(&mut self) -> Option<DevicePlan> {
-        if !self.params.logit_bias.is_empty() || self.ngram_armed() {
+        if !self.params.logit_bias.is_empty() || self.ngram_armed() || self.host_reasoning() {
             return None;
         }
         let p = &self.params;
@@ -290,6 +305,9 @@ impl Sampler {
     /// call from service sites whose backend + finish path implement the
     /// head readback (`supports_host_head`) - see the TruncCat doc.
     pub fn device_plan_trunc(&mut self) -> Option<DevicePlan> {
+        if self.host_reasoning() {
+            return None;
+        }
         if let Some(p) = self.device_plan() {
             return Some(p);
         }
@@ -333,16 +351,20 @@ impl Sampler {
     /// `device_plan_trunc` eligibility exactly (twin-consistency test).
     pub fn is_trunc_plannable(&self) -> bool {
         let p = &self.params;
-        self.is_spec_safe() && (p.temperature <= 0.0 || p.top_k <= 64)
+        !self.host_reasoning() && self.is_spec_safe() && (p.temperature <= 0.0 || p.top_k <= 64)
     }
 
     /// Non-consuming twin of [`Self::device_plan_trunc`] (see
     /// [`Self::peek_device_plan`] for the peek/commit contract).
     pub fn peek_device_plan_trunc(&self) -> Option<DevicePlan> {
+        if self.in_reasoning() {
+            return None;
+        }
         let mut tmp = Self {
             params: self.params.clone(),
             rng: self.rng.clone(),
             scratch: Vec::new(),
+            reasoning: None,
         };
         tmp.device_plan_trunc()
     }
@@ -373,7 +395,7 @@ impl Sampler {
     /// falls back to the classic plan, which stays lossless.
     pub fn rs_trunc_plan(&mut self) -> Option<DevicePlan> {
         let p = &self.params;
-        if p.temperature <= 0.0 || p.top_k > 64 {
+        if p.temperature <= 0.0 || p.top_k > 64 || self.host_reasoning() {
             return None;
         }
         if !p.logit_bias.is_empty()
@@ -418,12 +440,17 @@ impl Sampler {
     /// generator decides that internally from its budget. The uniform comes
     /// from a CLONE of the rng; call [`Self::commit_device_plan`] when a
     /// `FinishSample::Sampled` confirms the plan ran, so the seed stream
-    /// advances exactly as the host draw would have.
+    /// advances exactly as the host draw would have. Never inside a reasoning
+    /// block, armed or not: a finisher's row carries no stop mask.
     pub fn peek_device_plan(&self) -> Option<DevicePlan> {
+        if self.in_reasoning() {
+            return None;
+        }
         let mut tmp = Self {
             params: self.params.clone(),
             rng: self.rng.clone(),
             scratch: Vec::new(),
+            reasoning: None,
         };
         tmp.device_plan()
     }
@@ -544,10 +571,39 @@ impl Sampler {
         history: &[u32],
         legal: &mut dyn FnMut(u32) -> bool,
     ) -> Option<u32> {
+        self.process_row(logits, history);
+        self.draw_row(logits, Some(legal))
+    }
+
+    /// logit_bias, then the penalties, in place - everything before the draw.
+    fn process_row(&self, logits: &mut [f32], history: &[u32]) {
         self.apply_logit_bias(logits);
         self.apply_repeat_penalty(logits, history);
         self.apply_no_repeat_ngram(logits, history);
+    }
 
+    /// The draw over a row whose bias and penalties are already applied in
+    /// place - `legal` None is the unconstrained draw, which always yields.
+    /// Split from the processing so the reasoning-stop policy can read and
+    /// mask the processed row in between.
+    fn draw_row(
+        &mut self,
+        logits: &mut [f32],
+        legal: Option<&mut dyn FnMut(u32) -> bool>,
+    ) -> Option<u32> {
+        let Some(legal) = legal else {
+            if self.params.temperature <= 0.0 {
+                return Some(argmax(logits));
+            }
+            let u = self.next_uniform();
+            let p = &self.params;
+            if p.top_k == 0 && p.top_p >= 1.0 && p.min_p <= 0.0 {
+                // no truncation filter: sort-free categorical draw
+                return Some(sample_all(logits, 1.0 / p.temperature, u));
+            }
+            let n = self.build_nucleus(logits);
+            return Some(draw(&self.scratch[..n], u));
+        };
         if self.params.temperature <= 0.0 {
             loop {
                 let best = argmax(logits);
@@ -588,22 +644,9 @@ impl Sampler {
     /// Pick the next token id. `history` is the tokens so far (for the
     /// repetition penalty). `logits` is consumed as scratch.
     pub fn sample(&mut self, logits: &mut [f32], history: &[u32]) -> u32 {
-        self.apply_logit_bias(logits);
-        self.apply_repeat_penalty(logits, history);
-        self.apply_no_repeat_ngram(logits, history);
-
-        if self.params.temperature <= 0.0 {
-            return argmax(logits);
-        }
-
-        let u = self.next_uniform();
-        let p = &self.params;
-        if p.top_k == 0 && p.top_p >= 1.0 && p.min_p <= 0.0 {
-            // no truncation filter: sort-free categorical draw
-            return sample_all(logits, 1.0 / p.temperature, u);
-        }
-        let n = self.build_nucleus(logits);
-        draw(&self.scratch[..n], u)
+        self.process_row(logits, history);
+        self.draw_row(logits, None)
+            .expect("the unconstrained draw always yields")
     }
 
     /// One uniform in [0,1) per sampled token - every stochastic path draws

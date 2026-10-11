@@ -694,7 +694,7 @@ inline void q4a_unpack_group32_masked(uint4 words,float scale,float bias,threadg
         }
     }
 }
-template<uint BM,uint BN,uint BK,bool GroupLoad=false,uint Pad=0,bool PackedInput=false,uint LoadValues=32,uint Threads=128,bool Masked=false>
+template<uint BM,uint BN,uint BK,bool GroupLoad=false,uint Pad=0,bool PackedInput=false,uint LoadValues=32,uint Threads=128,bool Masked=false,bool Hoist=false>
 inline void q4a_expert_matrix(device const uchar* w,device const float* x,
     device const uint* lists,device const uint* counts,device const uint* tiles,
     device float* y,constant uint* p,uint2 g,uint tid,threadgroup bfloat* a,threadgroup bfloat* b) {
@@ -708,6 +708,17 @@ inline void q4a_expert_matrix(device const uchar* w,device const float* x,
     matmul2d<desc,execution_simdgroups<Threads/32>> op;
     auto acc=op.template get_destination_cooperative_tensor<decltype(at),decltype(bt),float>();
     for(uint i=0;i<acc.get_capacity();++i)acc[i]=0;
+    // Each lane owns the same routed rows at every K step. Keep their base
+    // addresses in registers rather than re-reading/dividing route IDs.
+    // UINT64_MAX represents padding and is never dereferenced.
+    ulong input_offsets[(BM*BK+Threads*4-1)/(Threads*4)];
+    if(Hoist) {
+        for(uint i=tid*4,j=0;i<BM*BK;i+=Threads*4,++j) {
+            uint r=i/BK;
+            uint entry=r<count ? lists[expert*p[2]+first+r] : p[2];
+            input_offsets[j]=entry<p[2] ? ulong(p[3] ? entry : entry/10)*p[0]+i%BK : ULONG_MAX;
+        }
+    }
     for(uint base=0;base<p[0];base+=BK) {
         if(BK==32) {
             for(uint i=tid;i<1024;i+=Threads) {
@@ -719,12 +730,12 @@ inline void q4a_expert_matrix(device const uchar* w,device const float* x,
         } else {
             // Four-value packed staging: each code word and scale/bias
             // pair is loaded once, then reused for four matrix operands.
-            for(uint i=tid*4;i<BM*BK;i+=Threads*4) {
+            for(uint i=tid*4,j=0;i<BM*BK;i+=Threads*4,++j) {
                 uint r=i/BK,k=base+i%BK;
-                uint entry=r<count ? lists[expert*p[2]+first+r] : p[2];
-                ulong offset=ulong(p[3] ? entry : entry/10)*p[0]+k;
+                uint entry=Hoist ? 0 : (r<count ? lists[expert*p[2]+first+r] : p[2]);
+                ulong offset=Hoist ? input_offsets[j]+base : ulong(p[3] ? entry : entry/10)*p[0]+k;
                 bfloat4 v=0;
-                if(entry<p[2]) {
+                if(Hoist ? input_offsets[j]!=ULONG_MAX : entry<p[2]) {
                     if(PackedInput)v=*reinterpret_cast<device const bfloat4*>(reinterpret_cast<device const bfloat*>(x)+offset);
                     else v=bfloat4(*reinterpret_cast<device const float4*>(x+offset));
                 }
@@ -868,6 +879,34 @@ kernel void q4a_expert_mm_group32_packed(device const uchar* w [[buffer(0)]],dev
     else
         q4a_expert_matrix<32,64,64,true,8,true>(w,x,lists,counts,tiles,y,p,g,tid,a,b);
 }
+
+// Schedule neighbouring row tiles consecutively for each
+// N tile, including a partial final group. The map is a bijection over the
+// live grid; launch padding returns before reading the tile list.
+#define Q4A_EXPERT_LOCALITY(Name,Group,Hoist) \
+kernel void Name(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]], \
+    device const uint* lists [[buffer(2)]],device const uint* counts [[buffer(3)]],device const uint* tiles [[buffer(4)]], \
+    device float* y [[buffer(5)]],constant uint* p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]], \
+    uint tid [[thread_index_in_threadgroup]]) { \
+    if(g.y>=tiles[0])return; \
+    if(Group>1) { \
+        uint columns=(p[1]+63)/64,first=g.y/Group*Group,height=min(uint(Group),tiles[0]-first); \
+        uint local=(g.y-first)*columns+g.x;g=uint2(local/height,first+local%height); \
+    } \
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y]; \
+    if(expert>=512 || first>=counts[expert])return; \
+    threadgroup bfloat a[32*72],b[64*72]; \
+    if(counts[expert]-first<=8)q4a_expert_matrix<8,64,64,true,8,true,32,128,false,Hoist>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+    else if(counts[expert]-first<=16)q4a_expert_matrix<16,64,64,true,8,true,32,128,false,Hoist>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+    else q4a_expert_matrix<32,64,64,true,8,true,32,128,false,Hoist>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+}
+Q4A_EXPERT_LOCALITY(q4a_expert_mm_hoisted,1,true)
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+Q4A_EXPERT_LOCALITY(q4a_expert_mm_locality2,2,false)
+Q4A_EXPERT_LOCALITY(q4a_expert_mm_locality4,4,false)
+Q4A_EXPERT_LOCALITY(q4a_expert_mm_locality4_hoisted,4,true)
+#endif
+#undef Q4A_EXPERT_LOCALITY
 
 #ifdef PADDOCK_KERNEL_DIAGNOSTICS
 // Expert-major 64-row schedule for gate/up weight-reuse diagnostics.

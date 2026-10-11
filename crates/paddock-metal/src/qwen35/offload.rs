@@ -94,6 +94,10 @@ impl Qwen35 {
             self.rotary,
             self.device.checkpoint_platform()
         );
+        // Optional snapshots used to split recurrent chunks only when a
+        // destination was available. Such states can carry a different
+        // reduction tree; do not restore them under the cache-independent plan.
+        layout.push_str(":retention-independent-recurrent-cuts-v1");
         if self.splash {
             layout.push_str(":splash-packed-v1:bf16-draft:stable-prefix-attention");
         }
@@ -160,23 +164,28 @@ impl Qwen35 {
         let disk = config
             .disk
             .map(|(root, quota)| (NvmeStore::dir_for(&root, &ns), quota));
-        let cache = ColdCache::open(
+        let cache = ColdCache::open_calibrated(
             ColdConfig {
                 ram_bytes: config.ram_bytes,
                 disk,
             },
             max_bytes,
+            &self.device.calibration_device(),
         )
         .map_err(MetalError::Model)?;
         let mut cost = paddock_engine::kv_tier::CostModel::new();
         cost.seed_nvme(cache.device_read_gbs);
+        let measured_prefill = cache.calibration().is_some();
+        if let Some(c) = cache.calibration() {
+            cost.adopt_calibration(c);
+        }
         self.cold = Some(Tier {
             scatter: crate::offload::ScatterWorker::new()?,
             restoring: Vec::new(),
             cache,
             root: ns.root(),
             cost,
-            measured_prefill: false,
+            measured_prefill,
             decisions: Default::default(),
             restores: Default::default(),
         });
@@ -353,12 +362,13 @@ impl Qwen35 {
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.reserved)
-            .min_by_key(|(_, c)| (usize::from(!c.history.is_empty()), c.touched))
+            .min_by_key(|(_, c)| (!c.history.is_empty(), c.anchor, c.touched))
             .map(|(i, _)| i)?;
         self.spill_checkpoint(index);
         self.cache[index].table.clear(&mut self.pool);
         self.cache[index].history.clear();
         self.cache[index].images.clear();
+        self.cache[index].anchor = false;
         while self.pool.free_blocks() < n / BLOCK_TOKENS {
             if !self.evict_checkpoint() {
                 return None;
@@ -467,6 +477,7 @@ impl Qwen35 {
         self.clock += 1;
         self.cache[index] = Checkpoint {
             reserved: false,
+            anchor: false,
             table,
             history: tokens[..n].to_vec(),
             touched: self.clock,
@@ -487,6 +498,7 @@ impl Qwen35 {
             disk.map_or(elapsed, |(_, predicted)| predicted),
             disk.is_some(),
         );
+        tier.cache.observe_cost(&tier.cost);
         tier.decisions.resolved_ok += 1;
         tier.decisions.useful_bytes += payload.bytes().len() as u64;
         tier.decisions.moved_bytes += payload.bytes().len() as u64;
@@ -546,6 +558,7 @@ impl Qwen35 {
                 disk.map_or(elapsed, |(_, predicted)| predicted),
                 disk.is_some(),
             );
+            tier.cache.observe_cost(&tier.cost);
             tier.decisions.resolved_ok += 1;
             tier.decisions.useful_bytes += restore.bytes as u64;
             tier.decisions.moved_bytes += restore.bytes as u64;
@@ -557,13 +570,14 @@ impl Qwen35 {
         }
     }
     pub(super) fn observe_cold_prefill(&mut self, tokens: u32, us: f64) {
-        if let Some(tier) = &mut self.cold {
-            if tier.measured_prefill {
-                tier.cost.observe_prefill(tokens, us);
-            } else if tokens > 0 && us.is_finite() && us > 0.0 {
-                tier.cost.seed_prefill(tokens, us);
-                tier.measured_prefill = true;
-            }
+        if let Some(tier) = &mut self.cold
+            && tokens > 0
+            && us.is_finite()
+            && us > 0.0
+        {
+            tier.cost.observe_prefill(tokens, us);
+            tier.measured_prefill = true;
+            tier.cache.observe_cost(&tier.cost);
         }
     }
     pub(super) fn cold_report(&self) -> Option<paddock_engine::kv_tier::TierReport> {
@@ -1094,6 +1108,7 @@ mod tests {
         };
         let mut model = load();
         let p: Vec<u32> = (1000..1537).collect();
+        let prefill_started = std::time::Instant::now();
         model.prepare(0, &p).unwrap();
         for (start, end) in [(0, 512), (512, 528)] {
             model
@@ -1110,6 +1125,7 @@ mod tests {
             .iter()
             .position(|c| c.history.len() == 528)
             .unwrap();
+        model.observe_cold_prefill(528, prefill_started.elapsed().as_secs_f64() * 1e6);
         let start = std::time::Instant::now();
         model.spill_checkpoint(index);
         let capture_ms = start.elapsed().as_secs_f64() * 1000.;
@@ -1178,8 +1194,18 @@ mod tests {
         assert_eq!(model.cold_stats().unwrap().io_failures, 0);
         assert!(model.cold_stats().unwrap().t2_written_day_bytes > 0);
         let compact_bytes = model.kv_bytes;
+        let calibration = model.cold.as_ref().unwrap().cost.calibration().unwrap();
         drop(model);
         let mut model = load();
+        assert_eq!(
+            model.cold.as_ref().unwrap().cache.calibration(),
+            Some(calibration)
+        );
+        assert!(model.cold.as_ref().unwrap().measured_prefill);
+        assert!(
+            model.cold.as_ref().unwrap().cost.calibration().is_none(),
+            "restart adopted a seed, not a new measurement"
+        );
         let start = std::time::Instant::now();
         while model.cold_loading(&p) {
             assert!(start.elapsed().as_secs() < 15);

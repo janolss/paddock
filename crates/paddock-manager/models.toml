@@ -6442,7 +6442,9 @@ revision = "2026-08-18"
   max_ctx = 32768
   max_batch = 64
   full_paged_kv = true
-  kv_reserve_sequences = 1
+  # Two complete prefix checkpoints per serving slot, scaled to actual
+  # concurrency by metal_cache_shape. This is the 64-slot envelope.
+  kv_reserve_sequences = 128
   # Upper bound of native scratch across the declared 32K/64-slot ceiling.
   # The estimator's hybrid checkpoint floor remains conservative; this is
   # not an exact admission prediction. The loader enforces the actual grant.

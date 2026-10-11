@@ -299,6 +299,8 @@ pub struct GpuNemotron {
     pub(crate) pipe_b: Option<batch::PipeB>,
     /// DFlash drafter (C2) - attached via --mtp, None otherwise.
     pub(crate) dflash: Option<dflash::DflashDrafter>,
+    /// the reasoning stop mask's lane (sampled.rs)
+    pub(crate) stop: crate::gpu::StopMaskLane,
     /// In-file MTP drafter (C3) - the GGUF's blk.52 nextn block,
     /// loaded whenever the file carries it and spec isn't killed
     /// (PADDOCK_NO_SPEC); an explicit DFlash attach evicts it.

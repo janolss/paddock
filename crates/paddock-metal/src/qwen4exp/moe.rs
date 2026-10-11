@@ -23,6 +23,8 @@ thread_local! {
     pub(super) static PAIRED_GATE_UP_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     pub(super) static PROMPT_GATE_UP_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(4) };
     pub(super) static EXTENDED_ORDER_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static SHARE_EXPERT_INPUT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static HOIST_EXPERT_INPUT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 pub(super) struct Weights {
@@ -352,138 +354,147 @@ impl Weights {
                 };
                 Some((order, name, columns, stripes))
             });
-        let project_experts = |w: &Weight, x: &Buffer, y: &Buffer, per_entry: bool| {
-            if matrix {
-                let n = w.n / EXPERTS;
-                let mut p = [0u32; 5 + affine::MAX_ROWS.div_ceil(32)];
-                p[..5].copy_from_slice(&[
-                    w.k as u32,
-                    n as u32,
-                    entries as u32,
-                    u32::from(per_entry),
-                    512,
-                ]);
-                p[5..].copy_from_slice(&matrix_mask);
-                let tail = cmd.tensor_accelerated();
-                #[cfg(test)]
-                let tail = tail && !BASELINE_EXPERT_TAIL_FOR_TEST.with(|v| v.get());
-                #[cfg(test)]
-                let loader = EXPERT_LOADER_FOR_TEST.with(|v| v.get());
-                #[cfg(not(test))]
-                let loader = 2;
-                let input_rows = if per_entry { entries } else { rows };
-                // Sorting is elected only for full-width down projections.
-                // The 1024-row fixture win did not carry over to real agent
-                // prompts. Keep gate/up and narrower batches unchanged.
-                // Reuse the existing projection arena; router
-                // logits are dead after q4b_route and hold the 512 offsets.
-                // Mixed decoding rows retain the vector arithmetic below.
-                let direct = tail && loader == 2 && per_entry && rows == affine::MAX_ROWS;
-                #[cfg(test)]
-                let direct = direct && DIRECT_EXPERT_FOR_TEST.with(|v| v.get());
-                let direct = cmd
-                    .projection_workspace()
-                    .filter(|workspace| direct && workspace.len() >= entries * w.k * 2);
-                if let Some(sorted) = direct {
-                    // Diagnostic only: exact, but the short-agent confirmation
-                    // regressed. Production retains the qualified 32-row route.
-                    #[cfg(not(test))]
-                    let wide = false;
+        let project_experts =
+            |w: &Weight, x: &Buffer, y: &Buffer, per_entry: bool, input_ready: bool| {
+                if matrix {
+                    let n = w.n / EXPERTS;
+                    let mut p = [0u32; 5 + affine::MAX_ROWS.div_ceil(32)];
+                    p[..5].copy_from_slice(&[
+                        w.k as u32,
+                        n as u32,
+                        entries as u32,
+                        u32::from(per_entry),
+                        512,
+                    ]);
+                    p[5..].copy_from_slice(&matrix_mask);
+                    let tail = cmd.tensor_accelerated();
                     #[cfg(test)]
-                    let wide = EXPERT_ROWS64_FOR_TEST.with(|v| v.get());
-                    // Gate/up have finished using the 32-row schedule. Reuse
-                    // its buffer for the down tiles; no extra live allocation.
-                    if wide {
+                    let tail = tail && !BASELINE_EXPERT_TAIL_FOR_TEST.with(|v| v.get());
+                    #[cfg(test)]
+                    let loader = EXPERT_LOADER_FOR_TEST.with(|v| v.get());
+                    #[cfg(not(test))]
+                    let loader = 2;
+                    let input_rows = if per_entry { entries } else { rows };
+                    // Sorting is elected only for full-width down projections.
+                    // The 1024-row fixture win did not carry over to real agent
+                    // prompts. Keep gate/up and narrower batches unchanged.
+                    // Reuse the existing projection arena; router
+                    // logits are dead after q4b_route and hold the 512 offsets.
+                    // Mixed decoding rows retain the vector arithmetic below.
+                    let direct = tail && loader == 2 && per_entry && rows == affine::MAX_ROWS;
+                    #[cfg(test)]
+                    let direct = direct && DIRECT_EXPERT_FOR_TEST.with(|v| v.get());
+                    let direct = cmd
+                        .projection_workspace()
+                        .filter(|workspace| direct && workspace.len() >= entries * w.k * 2);
+                    if let Some(sorted) = direct {
+                        // Diagnostic only: exact, but the short-agent confirmation
+                        // regressed. Production retains the qualified 32-row route.
+                        #[cfg(not(test))]
+                        let wide = false;
+                        #[cfg(test)]
+                        let wide = EXPERT_ROWS64_FOR_TEST.with(|v| v.get());
+                        // Gate/up have finished using the 32-row schedule. Reuse
+                        // its buffer for the down tiles; no extra live allocation.
+                        if wide {
+                            cmd.dispatch(
+                                "q4a_expert_plan64",
+                                &[&s.counts, &s.logits, &s.tiles],
+                                &[512],
+                                [1, 1, 1],
+                                512,
+                            );
+                        } else {
+                            cmd.dispatch(
+                                "q4a_expert_offsets",
+                                &[&s.counts, &s.logits],
+                                &[512],
+                                [1, 1, 1],
+                                512,
+                            );
+                        }
                         cmd.dispatch(
-                            "q4a_expert_plan64",
-                            &[&s.counts, &s.logits, &s.tiles],
-                            &[512],
-                            [1, 1, 1],
-                            512,
+                            if wide {
+                                "q4a_expert_pack64"
+                            } else {
+                                "q4a_expert_pack"
+                            },
+                            &[x, &s.lists, &s.counts, &s.tiles, &s.logits, sorted],
+                            &p,
+                            [w.k.div_ceil(512), Workspace::tiles(rows), 1],
+                            128,
+                        );
+                        cmd.dispatch(
+                            if wide {
+                                "q4a_expert_mm_direct64"
+                            } else {
+                                "q4a_expert_mm_direct"
+                            },
+                            &[
+                                &w.buffer, sorted, &s.lists, &s.counts, &s.tiles, &s.logits, y,
+                            ],
+                            &p,
+                            [n.div_ceil(64), Workspace::tiles(rows), 1],
+                            128,
                         );
                     } else {
+                        let packed = cmd.projection_workspace().filter(|workspace| {
+                            tail && loader == 2
+                                && workspace.len() >= input_rows.div_ceil(32) * 32 * w.k * 2
+                        });
+                        if let Some(packed) = packed.filter(|_| !input_ready) {
+                            cmd.dispatch(
+                                "q4a_input",
+                                &[x, packed],
+                                &[w.k as u32, n as u32, input_rows as u32, 0, 0, 0, 0],
+                                [(input_rows.div_ceil(32) * 32 * w.k).div_ceil(256), 1, 1],
+                                256,
+                            );
+                        }
                         cmd.dispatch(
-                            "q4a_expert_offsets",
-                            &[&s.counts, &s.logits],
-                            &[512],
-                            [1, 1, 1],
-                            512,
+                            if packed.is_some() {
+                                #[cfg(test)]
+                                let hoisted = HOIST_EXPERT_INPUT_FOR_TEST.with(|v| v.get());
+                                #[cfg(not(test))]
+                                let hoisted = true;
+                                if hoisted {
+                                    "q4a_expert_mm_hoisted"
+                                } else {
+                                    "q4a_expert_mm_group32_packed"
+                                }
+                            } else if tail && loader > 0 {
+                                "q4a_expert_mm_group32_pad"
+                            } else if tail {
+                                "q4a_expert_mm_tail"
+                            } else {
+                                "q4a_expert_mm_wide"
+                            },
+                            &[
+                                &w.buffer,
+                                packed.unwrap_or(x),
+                                &s.lists,
+                                &s.counts,
+                                &s.tiles,
+                                y,
+                            ],
+                            &p,
+                            [n.div_ceil(64), Workspace::tiles(rows), 1],
+                            128,
                         );
                     }
-                    cmd.dispatch(
-                        if wide {
-                            "q4a_expert_pack64"
-                        } else {
-                            "q4a_expert_pack"
-                        },
-                        &[x, &s.lists, &s.counts, &s.tiles, &s.logits, sorted],
-                        &p,
-                        [w.k.div_ceil(512), Workspace::tiles(rows), 1],
-                        128,
-                    );
-                    cmd.dispatch(
-                        if wide {
-                            "q4a_expert_mm_direct64"
-                        } else {
-                            "q4a_expert_mm_direct"
-                        },
-                        &[
-                            &w.buffer, sorted, &s.lists, &s.counts, &s.tiles, &s.logits, y,
-                        ],
-                        &p,
-                        [n.div_ceil(64), Workspace::tiles(rows), 1],
-                        128,
-                    );
+                    if vectors {
+                        cmd.dispatch(
+                            "q4a_expert_vector_masked",
+                            &[&w.buffer, x, &s.ids, y],
+                            &p,
+                            [n.div_ceil(16), entries, 1],
+                            128,
+                        );
+                    }
                 } else {
-                    let packed = cmd.projection_workspace().filter(|workspace| {
-                        tail && loader == 2
-                            && workspace.len() >= input_rows.div_ceil(32) * 32 * w.k * 2
-                    });
-                    if let Some(packed) = packed {
-                        cmd.dispatch(
-                            "q4a_input",
-                            &[x, packed],
-                            &[w.k as u32, n as u32, input_rows as u32, 0, 0, 0, 0],
-                            [(input_rows.div_ceil(32) * 32 * w.k).div_ceil(256), 1, 1],
-                            256,
-                        );
-                    }
-                    cmd.dispatch(
-                        if packed.is_some() {
-                            "q4a_expert_mm_group32_packed"
-                        } else if tail && loader > 0 {
-                            "q4a_expert_mm_group32_pad"
-                        } else if tail {
-                            "q4a_expert_mm_tail"
-                        } else {
-                            "q4a_expert_mm_wide"
-                        },
-                        &[
-                            &w.buffer,
-                            packed.unwrap_or(x),
-                            &s.lists,
-                            &s.counts,
-                            &s.tiles,
-                            y,
-                        ],
-                        &p,
-                        [n.div_ceil(64), Workspace::tiles(rows), 1],
-                        128,
-                    );
+                    affine::experts_ordered(cmd, w, x, &s.ids, y, entries, per_entry, order);
                 }
-                if vectors {
-                    cmd.dispatch(
-                        "q4a_expert_vector_masked",
-                        &[&w.buffer, x, &s.ids, y],
-                        &p,
-                        [n.div_ceil(16), entries, 1],
-                        128,
-                    );
-                }
-            } else {
-                affine::experts_ordered(cmd, w, x, &s.ids, y, entries, per_entry, order);
-            }
-        };
+            };
         #[cfg(test)]
         let fused = FUSED_GATE_UP_FOR_TEST.with(|v| v.get());
         #[cfg(not(test))]
@@ -624,10 +635,18 @@ impl Weights {
                 );
             }
         } else {
-            project_experts(&self.gate, x, &s.act, false);
+            project_experts(&self.gate, x, &s.act, false, false);
             // The down-output allocation is dead until gate/up activation is
             // complete, and is larger than the routed up plane. Reuse its prefix.
-            project_experts(&self.up, x, &s.down, false);
+            // These adjacent projections share the same immutable source and
+            // arena; gate only reads the packed input. No dispatch in between
+            // overwrites it. A different K or an unavailable arena still takes
+            // the existing conversion/fallback. This is not projection fusion:
+            // tile selection, contractions and BF16 boundaries stay identical.
+            let shared_input = self.gate.k == self.up.k;
+            #[cfg(test)]
+            let shared_input = shared_input && SHARE_EXPERT_INPUT_FOR_TEST.with(|v| v.get());
+            project_experts(&self.up, x, &s.down, false, shared_input);
             cmd.dispatch(
                 "mlx_swiglu",
                 &[&s.act, &s.down],
@@ -636,7 +655,7 @@ impl Weights {
                 256,
             );
         }
-        project_experts(&self.down, &s.act, &s.down, true);
+        project_experts(&self.down, &s.act, &s.down, true, false);
         if !vector_gate_up {
             affine::project(cmd, &self.shared_gate, x, &s.shared_gate, rows);
             affine::project(cmd, &self.shared_up, x, &s.shared_up, rows);

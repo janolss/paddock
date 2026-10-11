@@ -325,6 +325,37 @@ fn measure_levels(
     rungs.into_iter().map(|(_, name)| name).collect()
 }
 
+/// The reasoning-stop policy for a request whose render opened a think block
+/// (`paddock_engine::sampler::ReasoningStop`: the model's own stops do not end
+/// a reply inside its reasoning). The dialect's single-token close leaves the
+/// block, so does a tool call's opener where calls sit inside it, and a run
+/// of stop draws forces the thinking budget's own exit recipe. None where the
+/// render left thinking closed, where reasoning is channel-structured
+/// (Harmony, muse: a multi-token exit interleaved with stop semantics), or
+/// where the tokenizer has no single close token.
+pub(crate) fn stop_policy(
+    model: &crate::serving::ServingModel,
+    thinking_open: bool,
+) -> Option<paddock_engine::sampler::ReasoningStop> {
+    if !thinking_open {
+        return None;
+    }
+    let (close, call) = match model.dialect {
+        Dialect::QwenXml | Dialect::Laguna => ("</think>", Some("<tool_call>")),
+        Dialect::GemmaChannel => (crate::parsers::G_CLOSE, None),
+        _ => return None,
+    };
+    let close = model.tokenizer.token_to_id(close)?;
+    let mut leave = vec![close];
+    leave.extend(call.and_then(|c| model.tokenizer.token_to_id(c)));
+    let mut exit = model
+        .tokenizer
+        .encode(crate::chat::THINK_EXIT_PHRASE)
+        .ok()?;
+    exit.push(close);
+    Some(paddock_engine::sampler::ReasoningStop { leave, exit })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -187,6 +187,10 @@ fn expert_prefill_variant_cases(measure: bool) {
         "q4a_expert_mm_register",
         "q4a_expert_mm_masked",
         "q4a_expert_mm_rows64",
+        "q4a_expert_mm_hoisted",
+        "q4a_expert_mm_locality2",
+        "q4a_expert_mm_locality4",
+        "q4a_expert_mm_locality4_hoisted",
     ];
     let mut failures = Vec::new();
     for rows in if measure {
@@ -267,7 +271,7 @@ fn expert_prefill_variant_cases(measure: bool) {
                     p[5 + row / 32] &= !(1 << (row % 32));
                 }
                 let mut expected: Option<Vec<u32>> = None;
-                let mut times: [Vec<f64>; 12] = Default::default();
+                let mut times: [Vec<f64>; 16] = Default::default();
                 for round in 0..if measure { 7 } else { 1 } {
                     for index in 0..kernels.len() {
                         let route = (round + index) % kernels.len();

@@ -565,6 +565,26 @@ pub trait Generator: Send {
         false
     }
 
+    /// The backend runs the reasoning stop mask (pack slot 850) on the rows
+    /// of its device-sampled calls: `forward_batch_sampled`, the decode rows
+    /// of `forward_mixed_sampled` / `forward_unified_sampled`,
+    /// `forward_spec_batch` and `forward_spec_batch_plans`. A slot inside an
+    /// open reasoning block then keeps its device plans (see
+    /// `sampler/reasoning.rs`); without it such a slot picks on the host.
+    fn supports_stop_mask(&self) -> bool {
+        false
+    }
+
+    /// Masks for the NEXT of those calls, indexed like its per-row plans (the
+    /// greedy round: its flat verify rows). The call consumes them.
+    fn set_stop_masks(&mut self, _masks: Vec<Option<crate::sampler::StopMask>>) {}
+
+    /// The stop pressure of the last call's rows, indexed like the masks;
+    /// empty when no mask rode it.
+    fn take_stop_pressure(&mut self) -> Vec<bool> {
+        Vec::new()
+    }
+
     /// Stash the RS chain draws for the round about to be drafted (one entry
     /// per pending slot; consumed by the next `spec_draft_begin`). No-op on
     /// backends without the RS arm.
@@ -1688,6 +1708,15 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     }
     fn supports_device_trunc(&self) -> bool {
         self.device_trunc_supported()
+    }
+    fn supports_stop_mask(&self) -> bool {
+        self.stop_mask_supported()
+    }
+    fn set_stop_masks(&mut self, masks: Vec<Option<crate::sampler::StopMask>>) {
+        crate::gpu_model::qwen35::GpuQwen35::set_stop_masks(self, masks)
+    }
+    fn take_stop_pressure(&mut self) -> Vec<bool> {
+        crate::gpu_model::qwen35::GpuQwen35::take_stop_pressure(self)
     }
     fn forward_mixed_sampled(
         &mut self,

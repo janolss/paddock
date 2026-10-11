@@ -2882,6 +2882,7 @@ impl GpuQwen35 {
             sinks,
             kv_dtype,
             overlap_exec: None,
+            stop: Default::default(),
             lane_swapped: false,
             unified_inflight: None,
             scratch: None,

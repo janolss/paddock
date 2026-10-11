@@ -565,6 +565,7 @@ impl GpuNemotron {
             last_reused: Vec::new(),
             pipe_b: None,
             dflash: None,
+            stop: Default::default(),
             // the NVFP4 checkpoint's mtp.* planes are bf16 - a residency
             // class the expert enums don't carry; the NVFP4 lane's drafter
             // is DFlash (attach via --mtp)
@@ -929,6 +930,7 @@ impl GpuNemotron {
             last_reused: Vec::new(),
             pipe_b: None,
             dflash: None,
+            stop: Default::default(),
             mtp,
         })
     }

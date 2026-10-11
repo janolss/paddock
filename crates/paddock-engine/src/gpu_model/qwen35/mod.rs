@@ -1491,6 +1491,8 @@ pub struct GpuQwen35 {
     /// there and can overlap main-lane prefill spans once the scheduler
     /// interleaves them. None = classic single-lane serve.
     overlap_exec: Option<Arc<GpuExecutor>>,
+    /// the reasoning stop mask's lane (batch/sampled.rs, spec.rs)
+    stop: crate::gpu::StopMaskLane,
     /// True while `with_decode_lane` has the decode lane swapped into `exec`
     /// (re-entrancy guard - nested wrapped calls must not swap back).
     lane_swapped: bool,

@@ -45,6 +45,8 @@ mod projection_tests;
 #[cfg(test)]
 mod quant_boundary_tests;
 mod retention;
+#[cfg(test)]
+mod retention_tests;
 mod serving;
 mod spec;
 #[cfg(test)]
@@ -153,6 +155,8 @@ struct Pending {
 #[derive(Default)]
 struct Checkpoint {
     reserved: bool,
+    // Best-effort user-turn retention, not a pin or extra GPU allocation.
+    anchor: bool,
     table: BlockTable,
     history: Vec<u32>,
     touched: u64,
@@ -258,7 +262,7 @@ impl Qwen35 {
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.reserved && !c.history.is_empty())
-            .min_by_key(|(_, c)| c.touched)
+            .min_by_key(|(_, c)| (c.anchor, c.touched))
             .map(|(i, _)| i)
         else {
             return false;
@@ -274,6 +278,7 @@ impl Qwen35 {
         self.cache[index].table.clear(&mut self.pool);
         self.cache[index].history.clear();
         self.cache[index].images.clear();
+        self.cache[index].anchor = false;
         true
     }
 

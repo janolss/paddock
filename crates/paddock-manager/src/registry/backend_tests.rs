@@ -1248,6 +1248,15 @@ fn metal_nemotron_prices_only_native_trunk_and_actual_recurrent_blocks() {
     memory.apply(&mut shape);
     assert_eq!(shape.nextn_bytes, 0);
     assert_eq!(shape.workspace_bytes, 677817604);
+    assert_eq!(shape.kv_reserve_sequences, 128);
+    let env = paddock_estimator::Envelope {
+        concurrency: 4,
+        kv_dtype: paddock_estimator::KvDtype::F16,
+        spec: None,
+        offload: None,
+    };
+    crate::estimate::metal_cache_shape(&mut shape, model, &env);
+    assert_eq!(shape.kv_reserve_sequences, 8);
     let r = shape.recurrent.unwrap();
     assert_eq!(
         (
@@ -1259,9 +1268,9 @@ fn metal_nemotron_prices_only_native_trunk_and_actual_recurrent_blocks() {
         ),
         (23, 524288, 18432, 6144, 4)
     );
-    let kv = shape.kv_per_sequence(4096, paddock_estimator::KvDtype::F16) * 5;
-    let recurrent = r.layers * (r.state_elems + r.conv_elems) * r.elem_bytes * 5;
-    assert_eq!(kv + recurrent, 375480320);
+    let kv = shape.kv_per_sequence(4096, paddock_estimator::KvDtype::F16) * 12;
+    let recurrent = r.layers * (r.state_elems + r.conv_elems) * r.elem_bytes * 12;
+    assert_eq!(kv + recurrent, 901152768);
     // Switching an already projected registry must restore CUDA, including
     // its workspace, rather than retaining the Metal override in source data.
     let restored = metal.with_backend("cuda");

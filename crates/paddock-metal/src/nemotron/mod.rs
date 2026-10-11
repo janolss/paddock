@@ -8,6 +8,9 @@ use paddock_models::nemotron::NemotronBlock;
 use std::collections::VecDeque;
 mod forward;
 mod load;
+mod prefix;
+#[cfg(test)]
+mod prefix_tests;
 mod serving;
 #[cfg(test)]
 mod tests;
@@ -23,6 +26,7 @@ const FF: usize = 1856;
 const SHARED: usize = 3712;
 const CHUNK: usize = 512;
 const SPLITS: usize = 16;
+const PREFIX_PER_SLOT: usize = 2;
 
 struct Mamba {
     input: Weight,
@@ -33,7 +37,7 @@ struct Mamba {
     d: Weight,
     dt: Weight,
     norm: Weight,
-    // Slot count + one bounded reusable prefix snapshot, always F32.
+    // Live slots + bounded complete prefix snapshots, always F32.
     state: Buffer,
     window: Buffer,
 }
@@ -122,7 +126,8 @@ pub struct Nemotron {
     pending: VecDeque<Pending>,
     // KV refs and recurrent snapshots are published atomically after GPU
     // completion. Attention-only radix reuse is invalid for a Mamba model.
-    prefix: Slot,
+    prefixes: Vec<prefix::Checkpoint>,
+    prefix_clock: u64,
     pool: KvPool,
     context: usize,
     page_stride: usize,
@@ -131,9 +136,32 @@ pub struct Nemotron {
     pub last_gpu_seconds: f64,
     #[cfg(test)]
     scan_only: bool,
+    #[cfg(test)]
+    single_snapshot: bool,
 }
 impl Nemotron {
     fn copy_state(&self, dst: usize, src: Option<usize>) -> Result<()> {
+        if let Some(src) = src {
+            // Copy bytes, not arithmetic: one fenced blit replaces 46 compute
+            // dispatches for the complete Mamba state and convolution windows.
+            let copies = self
+                .layers
+                .iter()
+                .filter_map(|l| match &l.mixer {
+                    Mixer::Mamba(m) => Some(m),
+                    _ => None,
+                })
+                .flat_map(|m| {
+                    [(&m.state, STATE * 4), (&m.window, WINDOW * 4)]
+                        .map(|(b, n)| (b, src * n, b, dst * n, n))
+                })
+                .collect::<Vec<_>>();
+            self.device.copy_regions(&copies)
+        } else {
+            self.copy_state_kernel(dst, None)
+        }
+    }
+    fn copy_state_kernel(&self, dst: usize, src: Option<usize>) -> Result<()> {
         let cmd = self.device.begin()?;
         for l in &self.layers {
             if let Mixer::Mamba(m) = &l.mixer {
@@ -161,21 +189,28 @@ impl Nemotron {
                 "invalid Nemotron prefill slot/tokens/context".into(),
             ));
         }
-        let reused = if !self.prefix.history.is_empty()
-            && self.prefix.history.len() < tokens.len()
-            && tokens.starts_with(&self.prefix.history)
-        {
-            self.prefix.history.len()
-        } else {
-            0
-        };
-        self.copy_state(slot, (reused > 0).then_some(self.slots.len()))?;
+        let matched = self
+            .prefixes
+            .iter()
+            .take(self.prefix_limit())
+            .enumerate()
+            .filter(|(_, c)| {
+                !c.history.is_empty()
+                    && c.history.len() < tokens.len()
+                    && tokens.starts_with(&c.history)
+            })
+            .max_by_key(|(_, c)| c.history.len())
+            .map(|(i, c)| (i, c.history.len()));
+        let reused = matched.map_or(0, |(_, n)| n);
+        self.copy_state(slot, matched.map(|(i, _)| self.slots.len() + i))?;
         let s = &mut self.slots[slot];
         s.table.clear(&mut self.pool);
         s.history.clear();
-        if reused > 0 {
+        if let Some((index, _)) = matched {
             s.table
-                .share_prefix(self.prefix.table.blocks(), &mut self.pool);
+                .share_prefix(self.prefixes[index].table.blocks(), &mut self.pool);
+            self.prefix_clock += 1;
+            self.prefixes[index].touched = self.prefix_clock;
         }
         s.history.extend_from_slice(&tokens[..reused]);
         s.reused = reused;
@@ -186,12 +221,25 @@ impl Nemotron {
         if n == 0 || !n.is_multiple_of(BLOCK_TOKENS) {
             return Ok(());
         }
-        self.copy_state(self.slots.len(), Some(slot))?;
-        self.prefix.table.clear(&mut self.pool);
-        self.prefix
+        let history = &self.slots[slot].history;
+        let index = if self.prefix_limit() == 1 {
+            Some(0)
+        } else {
+            prefix::replacement(&self.prefixes, history)
+        };
+        let Some(index) = index else { return Ok(()) };
+        // Never leave an old key pointing at a partially overwritten state if
+        // the copy fails. Only the successful fence publishes a new pairing.
+        self.prefixes[index].clear(&mut self.pool);
+        self.copy_state(self.slots.len() + index, Some(slot))?;
+        self.prefixes[index]
             .table
             .share_prefix(self.slots[slot].table.blocks(), &mut self.pool);
-        self.prefix.history.clone_from(&self.slots[slot].history);
+        self.prefixes[index]
+            .history
+            .clone_from(&self.slots[slot].history);
+        self.prefix_clock += 1;
+        self.prefixes[index].touched = self.prefix_clock;
         Ok(())
     }
     fn prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>> {

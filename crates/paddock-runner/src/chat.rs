@@ -229,7 +229,7 @@ pub(crate) struct ThinkBudget {
 /// recipe (arXiv:2505.09388 §"thinking budget"): the model is steered into
 /// answering from what it has, instead of a bare close-tag slammed mid-word.
 /// The leading newlines detach it from whatever the budget landed inside.
-const THINK_EXIT_PHRASE: &str = "\n\nConsidering the limited time by the user, \
+pub(crate) const THINK_EXIT_PHRASE: &str = "\n\nConsidering the limited time by the user, \
      I have to give the solution based on the thinking directly now.\n";
 
 /// Resolve a requested thinking budget against this model. `knob` is the
@@ -1739,6 +1739,7 @@ fn prepare(
         // the OCR family's required repetition guard (reference parity),
         // 35/128 single page, 35/1024 multi-page, caller-overridable
         no_repeat_ngram: ocr.as_ref().map_or((0, 0, false), |o| o.guard()),
+        reasoning: crate::reasoning::stop_policy(model, thinking_open),
     };
 
     Ok(Prepared {

@@ -175,37 +175,50 @@ impl Generator for FlashNext {
         } else {
             budget
         };
-        let advances = crate::schedule::grants(
-            &self
-                .pending
-                .iter()
-                .map(|p| {
-                    // Cap eligible work before apportionment. Otherwise a
-                    // logical boundary discards most of a grant while a
-                    // neighbouring prompt could have used the spare rows.
-                    let mut remaining = if mlx {
-                        let plan = &self.slots[p.slot].plan;
-                        if decodes.is_empty() && self.groups_prompt_chunks() {
-                            let cap = if self.prefix.enabled() {
-                                self.capacity.min(plan.until_cut(p.offset))
-                            } else {
-                                self.capacity
-                            };
-                            plan.pass_rows(p.offset, cap)
+        let work = self
+            .pending
+            .iter()
+            .map(|p| {
+                // Cap eligible work before apportionment. Otherwise a
+                // logical boundary discards most of a grant while a
+                // neighbouring prompt could have used the spare rows.
+                let mut remaining = if mlx {
+                    let plan = &self.slots[p.slot].plan;
+                    if decodes.is_empty() && self.groups_prompt_chunks() {
+                        let cap = if self.prefix.enabled() {
+                            self.capacity.min(plan.until_cut(p.offset))
                         } else {
-                            plan.at(p.offset).1
-                        }
+                            self.capacity
+                        };
+                        plan.pass_rows(p.offset, cap)
                     } else {
-                        p.tokens.len() - p.offset
-                    };
-                    if self.prefix.enabled() {
-                        remaining = remaining.min(self.slots[p.slot].plan.until_cut(p.offset));
+                        plan.at(p.offset).1
                     }
-                    (remaining, p.tokens.len())
-                })
-                .collect::<Vec<_>>(),
+                } else {
+                    p.tokens.len() - p.offset
+                };
+                if self.prefix.enabled() {
+                    remaining = remaining.min(self.slots[p.slot].plan.until_cut(p.offset));
+                }
+                (remaining, p.tokens.len())
+            })
+            .collect::<Vec<_>>();
+        // Pair admission is diagnostic only until full-model arithmetic and
+        // serving tails qualify it. Pending order remains FIFO; no completed
+        // output is withheld and no request is moved to a hidden queue.
+        #[cfg(test)]
+        let work = if policy == 3 && decodes.is_empty() {
+            work.into_iter()
+                .enumerate()
+                .map(|(i, (n, total))| (if i < 2 { n } else { 0 }, total))
+                .collect::<Vec<_>>()
+        } else {
+            work
+        };
+        let advances = crate::schedule::grants(
+            &work,
             budget.min(self.prefill_tick_cap(decodes.len())),
-            decodes.is_empty() && policy == 0,
+            decodes.is_empty() && (policy == 0 || policy == 3),
         );
         for (p, &n) in self.pending.iter().zip(&advances) {
             for i in p.offset..p.offset + n {

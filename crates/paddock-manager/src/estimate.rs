@@ -439,7 +439,8 @@ pub(crate) fn artifact_shape(
 /// Qwen's Metal pool has three context slots per live slot without a tier,
 /// and live slots + one restore context + two staging blocks per slot with
 /// a tier (paddock-metal/qwen35/load.rs). Scale the catalog's maximum-envelope
-/// reservation for the concurrency actually requested.
+/// reservation for the concurrency actually requested. Nemotron likewise
+/// retains two complete checkpoints per live slot, but has no cold tier.
 pub(crate) fn metal_cache_shape(
     shape: &mut ModelShape,
     model: &crate::registry::CatalogModel,
@@ -455,6 +456,8 @@ pub(crate) fn metal_cache_shape(
         } else {
             2 * env.concurrency
         };
+    } else if model.family.as_deref() == Some("nemotron-h") {
+        shape.kv_reserve_sequences = 2 * env.concurrency;
     }
 }
 
@@ -1070,6 +1073,49 @@ mod tests {
             super::checkpoint_file_bytes(&dir.path().join("part-1.safetensors")),
             Some(7)
         );
+    }
+
+    #[test]
+    fn metal_nemotron_estimate_includes_every_reserved_checkpoint_at_actual_batch() {
+        use paddock_estimator::{Device, Envelope, KvDtype};
+        let registry = Registry::new(std::env::temp_dir()).with_backend("metal");
+        let model = registry.catalog_of("nemotron-3.5-lightning-30b").unwrap();
+        let artifact = model.artifact("q8").unwrap();
+        for batch in [1, 4, 16, 64] {
+            let mut shape = artifact.shape.clone().unwrap().into_model_shape(0, 0);
+            artifact.runtime.memory.as_ref().unwrap().apply(&mut shape);
+            shape.max_ctx = 4096;
+            let env = Envelope {
+                concurrency: batch,
+                kv_dtype: KvDtype::F16,
+                spec: None,
+                offload: None,
+            };
+            super::metal_cache_shape(&mut shape, model, &env);
+            assert_eq!(shape.kv_reserve_sequences, 2 * batch);
+            let device = Device {
+                free_bytes: 100 << 30,
+                total_bytes: 128 << 30,
+            };
+            let estimate = super::backend_estimate("metal", &shape, &env, &device);
+            assert_eq!(estimate.max_ctx, 4096);
+            assert_eq!(estimate.kv_pool, 4096 * 6 * 256 * 2 * 2 * (3 * batch));
+            let recurrent = 23 * (524288 + 18432) * 4 * (3 * batch);
+            assert!(estimate.state + estimate.overhead_parts.prefix_checkpoints >= recurrent);
+            let exact = Device {
+                free_bytes: estimate.resident + estimate.kv_pool,
+                ..device
+            };
+            assert_eq!(
+                super::backend_estimate("metal", &shape, &env, &exact).max_ctx,
+                4096
+            );
+            let short = Device {
+                free_bytes: exact.free_bytes - 1,
+                ..device
+            };
+            assert!(super::backend_estimate("metal", &shape, &env, &short).max_ctx < 4096);
+        }
     }
 
     #[test]

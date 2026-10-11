@@ -405,6 +405,9 @@ impl GpuNemotron {
         {
             let bs = self.batch.as_mut().expect("batch enabled");
             let vp = bs.verify.as_mut().expect("verify planes");
+            // the reasoning rows' stops masked before either pick
+            let at: Vec<usize> = (0..total).collect();
+            self.stop.launch(&exec, &mut vp.d_logits, 0, vocab, &at)?;
             match pick {
                 VerifyPick::Greedy => {
                     exec.argmax_rows(&vp.d_logits, &mut vp.d_picks, total, vocab)?
@@ -486,10 +489,12 @@ impl GpuNemotron {
                 .clone_dtoh(&view)
                 .map_err(|e| GpuError::Driver(e.to_string()))?
         };
+        self.stop.read(&exec)?;
 
         // per-slot accepted counts - service.rs's exact walk, re-derived
         // here so the state rollback can never disagree with the tokens the
-        // service streams
+        // service streams (cut where a reasoning row's mask stops holding,
+        // as the service's walk cuts it)
         let mut base = 0usize;
         let accepts: Vec<(usize, usize, usize)> = reqs
             .iter()
@@ -500,6 +505,7 @@ impl GpuNemotron {
                     a += 1;
                 }
                 base += chunk.len();
+                let a = a.min(self.stop.cut(off, &picks[off..off + chunk.len()]));
                 (slot, off, a + 1)
             })
             .collect();

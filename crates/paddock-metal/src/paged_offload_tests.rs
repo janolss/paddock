@@ -50,7 +50,9 @@ fn paged_family_disk_restart_c4_all_logits() {
         .map(|s| (0..537).map(|i| 1000 + s * 2000 + i).collect())
         .collect();
     for (s, p) in prompts.iter().enumerate() {
+        let started = Instant::now();
         m.forward_prefill(s, p).unwrap();
+        m.tier_observe_prefill(p.len() as u32, started.elapsed().as_secs_f64() * 1e6);
     }
     m.reset();
     let mut reference = Vec::new();

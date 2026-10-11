@@ -49,6 +49,9 @@ struct Prepared {
     best_of: usize,
     /// prepend the prompt to each returned text
     echo: bool,
+    /// the prompt as text: the caller's, or a token prompt's decode (echo and
+    /// the legacy `text_offset` base count over it)
+    prompt_text: String,
 }
 
 /// Rank a candidate by log probability per TOKEN, which is what OpenAI's
@@ -98,16 +101,34 @@ fn prepare(
     output_ceiling: Option<usize>,
     sd: &crate::routes::SamplingDefaults,
 ) -> Result<Prepared, String> {
-    let mut prompt_ids = model
-        .tokenizer
-        .encode(req.prompt.first())
-        .map_err(|e| e.to_string())?;
-    // base-completion convention: lead with BOS when the model has one
-    if let Some(bos) = model.bos
-        && prompt_ids.first() != Some(&bos)
-    {
-        prompt_ids.insert(0, bos);
-    }
+    let (prompt_ids, prompt_text) = match req.prompt.token_ids() {
+        // ids the caller tokenized: the model reads exactly these (OpenAI's
+        // and vLLM's contract), so there is no BOS to add - only ids the
+        // vocabulary has, since the embedding lookup trusts them
+        Some(ids) => {
+            let vocab = model.tokenizer.vocab_size();
+            if let Some(&bad) = ids.iter().find(|&&t| t as usize >= vocab) {
+                return Err(format!(
+                    "prompt token id {bad} is outside the vocabulary (0..{vocab})"
+                ));
+            }
+            let text = model.tokenizer.decode(ids, false).unwrap_or_default();
+            (ids.to_vec(), text)
+        }
+        None => {
+            let mut ids = model
+                .tokenizer
+                .encode(req.prompt.first())
+                .map_err(|e| e.to_string())?;
+            // base-completion convention: lead with BOS when the model has one
+            if let Some(bos) = model.bos
+                && ids.first() != Some(&bos)
+            {
+                ids.insert(0, bos);
+            }
+            (ids, req.prompt.first().to_owned())
+        }
+    };
 
     crate::chat::validate_sampling(
         req.temperature,
@@ -141,6 +162,8 @@ fn prepare(
         // raw completions carry no images, so the OCR family's ngram
         // default never applies here
         no_repeat_ngram: (0, 0, false),
+        // a raw prompt carries no rendered think block to guard
+        reasoning: None,
     };
 
     let stop_strings = req.stop.as_ref().map(|s| s.to_vec()).unwrap_or_default();
@@ -163,6 +186,7 @@ fn prepare(
         n,
         best_of,
         echo: req.echo,
+        prompt_text,
     })
 }
 
@@ -223,9 +247,9 @@ pub async fn handle(
         tokenizer: model.tokenizer.clone(),
         prompt_len: prepared.prompt_ids.len(),
         // legacy text_offset counts characters over prompt + completion
-        prompt_chars: req.prompt.first().chars().count(),
+        prompt_chars: prepared.prompt_text.chars().count(),
         logprobs: prepared.logprobs.is_some(),
-        echo: prepared.echo.then(|| req.prompt.first().to_owned()),
+        echo: prepared.echo.then(|| prepared.prompt_text.clone()),
         scope,
     };
 

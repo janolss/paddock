@@ -9061,6 +9061,12 @@ pub struct KernelTableV1 {
     /// Slot 849: `pd_dl_order_votes` - `votes[j] = sum_{i != j} sigmoid(s[i][j]
     /// - s[j][i])` over the global pointer's `[q][q]` scores.
     pub dl_order_votes: Option<DlOrderVotesFn>,
+    /// Slot 850: `pd_stop_mask_rows` - the reasoning stop mask: rows whose
+    /// `par` (8 u32: active, inv_t bits, n_stops, 4 stop ids, pad) is active
+    /// get `flags[row]` = stop pressure (a stop within ln 2 of the max after
+    /// temperature, at the max when greedy) and their stop logits set to
+    /// -inf, in place, before the sampling kernels run.
+    pub stop_mask_rows: Option<StopMaskRowsFn>,
 }
 
 /// See [`KernelTableV1::rmsnorm_add_scale_norm`].
@@ -10986,7 +10992,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 835;
+pub const KERNEL_TABLE_SLOTS: usize = 836;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,
@@ -14273,6 +14279,16 @@ pub type DlRefStepFn = unsafe extern "C" fn(
     delta: *const core::ffi::c_void,
     ref16: *mut core::ffi::c_void,
     q: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::stop_mask_rows`].
+pub type StopMaskRowsFn = unsafe extern "C" fn(
+    logits: *mut core::ffi::c_void,
+    par: *const core::ffi::c_void,
+    flags: *mut core::ffi::c_void,
+    rows: u32,
+    n: u32,
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 

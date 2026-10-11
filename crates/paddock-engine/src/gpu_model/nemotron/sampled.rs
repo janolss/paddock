@@ -76,11 +76,14 @@ impl GpuNemotron {
     }
 
     /// Sample head_logits rows 0..r on device with `plans`; only Host-plan
-    /// rows pay a vocab-row readback. Assumes the head already ran.
+    /// rows pay a vocab-row readback. Assumes the head already ran. `masked`:
+    /// these rows are the call's rows 0..r, the ones the service's stop masks
+    /// index (a finisher's lone row is not).
     pub(super) fn sample_head_rows(
         &mut self,
         r: usize,
         plans: &[crate::generator::RowSample],
+        masked: bool,
     ) -> Result<crate::generator::SampledStep, GpuModelError> {
         use crate::generator::{RowSample, SampledStep};
         assert_eq!(plans.len(), r, "one plan per row");
@@ -100,6 +103,11 @@ impl GpuNemotron {
                     .try_slice_mut(0..r * 4)
                     .ok_or_else(|| GpuError::Driver("d_tpar slice".into()))?;
                 exec.stream.memcpy_htod(t, &mut v).map_err(drv)?;
+            }
+            if masked {
+                let at: Vec<usize> = (0..r).collect();
+                self.stop
+                    .launch(&exec, &mut sc.head_logits, 0, vocab, &at)?;
             }
             exec.sample_rows_at(&sc.head_logits, &sc.d_par, 0, &mut sc.d_out, 0, r, vocab)?;
             if tpar.is_some() {
@@ -180,7 +188,7 @@ impl GpuNemotron {
         self.step_replay(r)?;
         self.reply_after_rows(ident, positions)?;
         self.dflash_note_ticks(ident, positions);
-        let step = self.sample_head_rows(r, plans)?;
+        let step = self.sample_head_rows(r, plans, true)?;
         self.mtp_append_ticks(ident, positions)?;
         Ok(step)
     }

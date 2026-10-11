@@ -1,6 +1,16 @@
 use super::*;
 use paddock_engine::generator::{GenError, Generator};
 impl Generator for Nemotron {
+    fn anchor_at(&mut self, slot: usize, tokens: &[u32], upto: usize) {
+        let Some(s) = self.slots.get(slot) else {
+            return;
+        };
+        let upto = upto.min(s.history.len()).min(tokens.len());
+        let limit = self.prefix_limit();
+        if let Some(at) = prefix::mark_anchor(&mut self.prefixes[..limit], tokens, upto) {
+            tracing::debug!(at, "Metal Nemotron user-turn checkpoint anchored");
+        }
+    }
     fn reset(&mut self) {
         self.pending.clear();
         for s in &mut self.slots {

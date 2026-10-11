@@ -160,9 +160,11 @@ impl Nemotron {
             )));
         }
         let page_stride = context.div_ceil(BLOCK_TOKENS);
-        let blocks = page_stride * (max_batch + 1);
+        let prefix_count = PREFIX_PER_SLOT * max_batch;
+        let state_slots = max_batch + prefix_count;
+        let blocks = page_stride * state_slots;
         let kv_layer = blocks * BLOCK_TOKENS * 256 * 2;
-        let cache_bytes = (12 * kv_layer + 23 * (max_batch + 1) * (STATE + WINDOW) * 4) as u64;
+        let cache_bytes = (12 * kv_layer + 23 * state_slots * (STATE + WINDOW) * 4) as u64;
         let sizes = Scratch::sizes(max_batch, page_stride);
         let device = MetalDevice::new(budget)?;
         let required = payload + cache_bytes + sizes.iter().sum::<usize>() as u64;
@@ -192,8 +194,8 @@ impl Nemotron {
                     d: w("ssm_d", &[1, 64])?,
                     dt: w("ssm_dt.bias", &[64])?,
                     norm: w("ssm_norm.weight", &[512, 8])?,
-                    state: device.alloc((max_batch + 1) * STATE * 4)?,
-                    window: device.alloc((max_batch + 1) * WINDOW * 4)?,
+                    state: device.alloc(state_slots * STATE * 4)?,
+                    window: device.alloc(state_slots * WINDOW * 4)?,
                 }),
                 NemotronBlock::Attention => Mixer::Attention(Attention {
                     q: w("attn_q.weight", &[WIDTH, 4096])?,
@@ -234,7 +236,10 @@ impl Nemotron {
             scratch,
             slots: (0..max_batch).map(|_| Slot::default()).collect(),
             pending: VecDeque::new(),
-            prefix: Slot::default(),
+            prefixes: (0..prefix_count)
+                .map(|_| prefix::Checkpoint::default())
+                .collect(),
+            prefix_clock: 0,
             pool: KvPool::with_blocks(blocks as u32),
             context,
             page_stride,
@@ -243,6 +248,8 @@ impl Nemotron {
             last_gpu_seconds: 0.,
             #[cfg(test)]
             scan_only: false,
+            #[cfg(test)]
+            single_snapshot: false,
         })
     }
 }

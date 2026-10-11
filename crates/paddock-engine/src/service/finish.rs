@@ -1,4 +1,12 @@
-//! How a sequence ended - the engine's half of the APIs' finish reasons.
+//! How a sequence ended - the engine's half of the APIs' finish reasons. Every
+//! request ends with a `Done` or an `Error`, shutdown included; a stream that
+//! closes bare was cut off, and `next_event` hands it to the caller as one.
+
+use std::sync::mpsc::Receiver;
+
+use tokio::sync::mpsc::UnboundedReceiver;
+
+use super::{EngineError, GenRequest, Slot, TokenEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
@@ -20,5 +28,139 @@ impl FinishReason {
             FinishReason::Stop | FinishReason::Repetition => "stop",
             FinishReason::Length => "length",
         }
+    }
+}
+
+impl EngineError {
+    /// A request whose events stopped with neither a finish nor an error.
+    pub fn unfinished() -> Self {
+        EngineError::internal("the engine ended the request without finishing it")
+    }
+}
+
+/// The next event of a request; a bare close becomes `EngineError::unfinished`
+/// (never `None`). A closed stream used to read as a finished one, and every
+/// surface reported the cut-off reply as a normal end of turn.
+pub async fn next_event(rx: &mut UnboundedReceiver<TokenEvent>) -> Option<TokenEvent> {
+    Some(
+        rx.recv()
+            .await
+            .unwrap_or_else(|| TokenEvent::Error(EngineError::unfinished())),
+    )
+}
+
+/// Shutdown: every request the scheduler still holds - live, preempted for
+/// recompute, waiting for an exclusive multimodal run, or queued behind them -
+/// ends with a retryable error. Dropped silently, its stream closed with no
+/// finish, which every surface reported as a normal end of turn: a runner
+/// stopped mid-reply (a model switch, a restart) handed its clients a cut-off
+/// reply as complete, and Claude Code kept it.
+pub(super) fn fail_held_requests(
+    slots: &mut [Option<Slot>],
+    preempted: &mut Vec<Slot>,
+    mm_pending: Option<GenRequest>,
+    rx: &Receiver<GenRequest>,
+) {
+    let err = || {
+        TokenEvent::Error(EngineError::overloaded(
+            "the server is shutting down - retry the request",
+        ))
+    };
+    for s in slots
+        .iter_mut()
+        .filter_map(Option::take)
+        .chain(preempted.drain(..))
+    {
+        let _ = s.events.send(err());
+    }
+    for req in mm_pending.into_iter().chain(rx.try_iter()) {
+        let _ = req.events.send(err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::super::{ErrorClass, admit};
+    use super::*;
+    use crate::metrics::EngineMetrics;
+    use crate::sampler::SamplingParams;
+
+    fn req(events: tokio::sync::mpsc::UnboundedSender<TokenEvent>) -> GenRequest {
+        GenRequest {
+            prompt: vec![1, 2, 3],
+            max_tokens: 64,
+            sampler: SamplingParams::default(),
+            stop_tokens: Vec::new(),
+            events,
+            mm_chunks: None,
+            constraint: None,
+            logprobs: None,
+            submitted: None,
+            canvas_read: None,
+            user_turn: false,
+        }
+    }
+
+    fn overloaded(rx: &mut tokio::sync::mpsc::UnboundedReceiver<TokenEvent>) -> bool {
+        let mut last = None;
+        while let Ok(ev) = rx.try_recv() {
+            last = Some(ev);
+        }
+        matches!(last, Some(TokenEvent::Error(e)) if e.class == ErrorClass::Overloaded)
+    }
+
+    /// A request whose events stop with no finish reads as an error, not as
+    /// the end of the stream.
+    #[tokio::test]
+    async fn a_bare_close_reads_as_unfinished() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(TokenEvent::Token {
+            id: 7,
+            logprobs: None,
+        })
+        .unwrap();
+        drop(tx);
+        assert!(matches!(
+            next_event(&mut rx).await,
+            Some(TokenEvent::Token { id: 7, .. })
+        ));
+        let Some(TokenEvent::Error(e)) = next_event(&mut rx).await else {
+            panic!("a bare close must arrive as an error");
+        };
+        assert_eq!(e.class, ErrorClass::Internal);
+        assert!(e.message.contains("without finishing"), "{}", e.message);
+    }
+
+    /// A live request and one still queued both end with a retryable error
+    /// when the engine shuts down - not a bare close, which the surfaces
+    /// reported as a finished reply.
+    #[test]
+    fn shutdown_fails_live_and_queued_requests_with_a_retryable_error() {
+        let metrics = Arc::new(EngineMetrics::default());
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slots: Vec<Option<Slot>> = vec![None];
+        struct Ctx;
+        impl crate::generator::Generator for Ctx {
+            fn reset(&mut self) {}
+            fn forward(&mut self, _: u32) -> Result<Vec<f32>, crate::generator::GenError> {
+                Ok(vec![0.])
+            }
+            fn vocab(&self) -> usize {
+                1
+            }
+            fn max_context(&self) -> usize {
+                4096
+            }
+        }
+        assert!(admit(&mut slots, req(live_tx), &Ctx, &metrics));
+        let (queue_tx, queue) = std::sync::mpsc::channel();
+        let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::unbounded_channel();
+        queue_tx.send(req(waiting_tx)).unwrap();
+        fail_held_requests(&mut slots, &mut Vec::new(), None, &queue);
+        assert!(slots.iter().all(Option::is_none), "the slot is released");
+        assert!(overloaded(&mut live_rx), "the live request");
+        assert!(overloaded(&mut waiting_rx), "the queued request");
     }
 }

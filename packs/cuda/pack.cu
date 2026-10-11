@@ -32,6 +32,7 @@
 #include "src/deltanet/split.cuh"   // split walk/o-pass + shared tf32 mma helpers (needs int8_mma's PD_DNC_* defines; stage2_sample's launcher dispatches it)
 #include "src/deltanet/walk_rs.cuh"  // register-state bf16-operand walk (needs split.cuh's pd_dnc_cpa16; stage2_sample's launcher dispatches it)
 #include "src/deltanet/stage2_sample.cuh"
+#include "src/deltanet/stop_mask.cuh"    // reasoning stop mask, run on the logits before the samplers
 #include "src/deltanet/spec_rs.cuh"   // canonical spec rejection sampling (sampled drafts + full-q verify)
 #include "src/deltanet/slots_runs.cuh"  // row-exact verify GDN walk: slot 564's decode body over a run's rows (needs stage2_sample's slots env + abi's state helpers)
 #include "src/gemm/q8_rows.cuh"        // row-exact multi-row twins of the batch-1 Q8_0 GEMVs + the K-split Q8_0 GEMV (abi.cuh helpers only)

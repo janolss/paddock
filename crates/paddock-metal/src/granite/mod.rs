@@ -168,6 +168,7 @@ impl Granite {
             })
             .collect::<Vec<_>>();
         self.cold = Some(crate::paged_offload::PagedTier::open(
+            &self.device,
             config,
             paths,
             layout.as_bytes(),

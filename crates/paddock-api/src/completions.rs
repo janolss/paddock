@@ -4,21 +4,37 @@
 
 use serde::{Deserialize, Serialize};
 
-/// `prompt` accepts a string or an array of strings per the OpenAI schema.
+/// `prompt` accepts a string, an array of strings, an array of token ids or
+/// an array of token-id arrays, per the OpenAI schema. Strings come first, so
+/// `[]` stays the empty text prompt it always was.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Prompt {
     Single(String),
     Many(Vec<String>),
+    Tokens(Vec<u32>),
+    ManyTokens(Vec<Vec<u32>>),
 }
 
 impl Prompt {
-    /// The MVP serves a single prompt; arrays take element 0 (multi-prompt
-    /// batching lands with the P2 scheduler).
+    /// The text prompt ("" for a token prompt). The MVP serves a single
+    /// prompt; arrays take element 0 (multi-prompt batching lands with the P2
+    /// scheduler).
     pub fn first(&self) -> &str {
         match self {
             Prompt::Single(s) => s,
             Prompt::Many(v) => v.first().map(String::as_str).unwrap_or(""),
+            Prompt::Tokens(_) | Prompt::ManyTokens(_) => "",
+        }
+    }
+
+    /// The token ids when the caller sent ids instead of text (element 0 of a
+    /// batch). They go to the model as sent: no tokenizing, no BOS.
+    pub fn token_ids(&self) -> Option<&[u32]> {
+        match self {
+            Prompt::Tokens(t) => Some(t),
+            Prompt::ManyTokens(v) => Some(v.first().map(Vec::as_slice).unwrap_or(&[])),
+            Prompt::Single(_) | Prompt::Many(_) => None,
         }
     }
 }
@@ -191,5 +207,28 @@ impl CompletionResponse {
     /// carries the full text + usage.
     pub fn object_name() -> &'static str {
         "text_completion"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Prompt;
+
+    fn parse(v: &str) -> Prompt {
+        serde_json::from_str(v).unwrap()
+    }
+
+    /// Every shape OpenAI documents for `prompt`, and `[]` still the empty
+    /// text prompt.
+    #[test]
+    fn prompt_takes_text_and_token_ids() {
+        assert_eq!(parse(r#""hi""#).first(), "hi");
+        assert_eq!(parse(r#"["a", "b"]"#).first(), "a");
+        assert_eq!(parse(r#"[]"#).token_ids(), None);
+        let t = parse("[1, 2, 248046]");
+        assert_eq!(t.token_ids(), Some(&[1, 2, 248046][..]));
+        assert_eq!(t.first(), "");
+        assert_eq!(parse("[[5, 6], [7]]").token_ids(), Some(&[5, 6][..]));
+        assert!(serde_json::from_str::<Prompt>("[-1]").is_err());
     }
 }

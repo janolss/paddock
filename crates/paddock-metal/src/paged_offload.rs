@@ -50,6 +50,7 @@ fn spans<'a>(planes: &[Plane<'a>], blocks: &[u32]) -> Vec<offload::Span<'a>> {
 }
 impl PagedTier {
     pub(crate) fn open(
+        device: &MetalDevice,
         config: crate::KvOffloadConfig,
         paths: &[&Path],
         layout: &[u8],
@@ -66,23 +67,28 @@ impl PagedTier {
                 "KV offload RAM/transfer budget cannot hold three complete attention pages".into(),
             ));
         }
-        let cache = ColdCache::open(
+        let cache = ColdCache::open_calibrated(
             ColdConfig {
                 ram_bytes: config.ram_bytes,
                 disk: config.disk.map(|(p, q)| (NvmeStore::dir_for(&p, &ns), q)),
             },
             page_bytes * context.div_ceil(BLOCK_TOKENS),
+            &device.calibration_device(),
         )
         .map_err(MetalError::Model)?;
         let mut cost = CostModel::new();
         cost.seed_nvme(cache.device_read_gbs);
+        let measured = cache.calibration().is_some();
+        if let Some(c) = cache.calibration() {
+            cost.adopt_calibration(c);
+        }
         Ok(Self {
             scatter: offload::ScatterWorker::new()?,
             restoring: None,
             cache,
             root: ns.root(),
             cost,
-            measured: false,
+            measured,
             decisions: Default::default(),
             reads: Default::default(),
             context,
@@ -152,6 +158,7 @@ impl PagedTier {
                 disk.map_or(elapsed, |d| d.1),
                 disk.is_some(),
             );
+            self.cache.observe_cost(&self.cost);
             self.decisions.resolved_ok += 1;
             self.decisions.useful_bytes += r.bytes as u64;
             self.decisions.moved_bytes += r.bytes as u64;
@@ -274,11 +281,10 @@ impl PagedTier {
         }
     }
     pub(crate) fn observe(&mut self, n: u32, us: f64) {
-        if self.measured {
+        if n > 0 && us.is_finite() && us > 0. {
             self.cost.observe_prefill(n, us);
-        } else if n > 0 && us.is_finite() && us > 0. {
-            self.cost.seed_prefill(n, us);
             self.measured = true;
+            self.cache.observe_cost(&self.cost);
         }
     }
     pub(crate) fn stats(&self) -> TierStats {
@@ -319,6 +325,78 @@ mod tests {
     use super::*;
     use objc2_metal::MTLBuffer;
     #[test]
+    fn restart_prices_first_hit_before_prefill_and_relearns_from_live_measurement() {
+        let dir = std::env::temp_dir().join(format!(
+            "paddock-paged-cost-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("identity");
+        std::fs::write(&source, b"test-checkpoint").unwrap();
+        let device = MetalDevice::new(Some(64 << 20)).unwrap();
+        let buffer = device.upload(&vec![29u8; 16 * 256]).unwrap();
+        let planes = [(&buffer, 256)];
+        let config = crate::KvOffloadConfig {
+            ram_bytes: 4 << 20,
+            disk: Some((dir.join("disk"), 8 << 20)),
+            scope: b"cost-test".to_vec(),
+        };
+        let versions = offload::versions(&source).unwrap();
+        let open = || {
+            PagedTier::open(
+                &device,
+                config.clone(),
+                &[&source],
+                b"one-plane",
+                &versions,
+                &planes,
+                128,
+            )
+            .unwrap()
+        };
+        let mut tier = open();
+        let tokens: Vec<u32> = (0..65).collect();
+        tier.observe(64, 1.0); // Deliberately cheap recompute: a read should lose.
+        tier.capture(&device, &planes, &tokens, &[0, 1, 2, 3]);
+        drop(tier); // Joins the worker and preserves measured costs and payload.
+        let mut tier = open();
+        assert!(
+            tier.measured,
+            "a device-matched seed can price the first hit"
+        );
+        assert!(tier.cost.calibration().is_none(), "not measured live yet");
+        let mut pool = KvPool::with_blocks(16);
+        let mut radix = PagedRadix::new();
+        assert!(!tier.loading(&tokens, &planes, &mut pool, &mut radix));
+        assert_eq!(tier.decisions.elected_recompute, 1);
+        assert!(tier.restoring.is_none());
+        assert_eq!(
+            tier.cache.stats().open_tickets,
+            0,
+            "no speculative disk I/O"
+        );
+        tier.observe(64, 1_000_000.);
+        assert_eq!(
+            tier.cost.calibration().unwrap().prefill_tpus,
+            64. / 1_000_000.,
+            "first live sample replaces, not smooths, the seed"
+        );
+        let start = Instant::now();
+        while tier.loading(&tokens, &planes, &mut pool, &mut radix) {
+            assert!(start.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(radix.match_prefix(&tokens).len(), 4);
+        assert_eq!(tier.decisions.served_from_nvme, 1);
+        assert_eq!(tier.stats().integrity_failures, 0);
+        drop(tier);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn paged_restore_owns_pages_until_fenced_even_without_request() {
         let dir = std::env::temp_dir().join(format!(
             "paddock-paged-owner-{}-{}",
@@ -336,6 +414,7 @@ mod tests {
         let b = device.upload(&vec![42u8; 16 * 256]).unwrap();
         let planes = [(&a, 256), (&b, 256)];
         let mut tier = PagedTier::open(
+            &device,
             crate::KvOffloadConfig {
                 ram_bytes: 4 << 20,
                 disk: None,

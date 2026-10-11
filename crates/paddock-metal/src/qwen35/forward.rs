@@ -167,7 +167,11 @@ impl Qwen35 {
                 }
                 let images = self.slots[slot].mm.as_ref().map_or(&[][..], |m| &m.keys);
                 let keep_from = self.slots[slot].cuts[0];
-                let Some(index) = retention::replacement(&self.cache, &history, images, keep_from)
+                let pending_cut = checkpoints
+                    .iter()
+                    .any(|(_, s, h): &(usize, usize, Vec<u32>)| *s == slot && h.len() >= keep_from);
+                let Some(index) =
+                    retention::replacement(&self.cache, &history, images, keep_from, pending_cut)
                 else {
                     // Async cold restores can still own checkpoint state after
                     // a requesting slot is cancelled/reused. Capturing a prefix
@@ -190,6 +194,7 @@ impl Qwen35 {
                 self.cache[index].reserved = true;
                 self.cache[index].table.clear(&mut self.pool);
                 self.cache[index].history.clear();
+                self.cache[index].anchor = false;
                 let destination = (self.slots.len() + index + 1) as u32;
                 checkpoint_rows[r] = destination;
                 cuts[cut_index * 2] = r as u32;
@@ -221,7 +226,13 @@ impl Qwen35 {
                 let mut r = first;
                 while r < end {
                     let mut next = (r + 32).min(end);
-                    if let Some(cut) = (r..next).find(|&i| checkpoint_rows[i] != 0) {
+                    // A cache decision must not change the recurrent reduction
+                    // tree. Keep the declared prompt boundaries even when an
+                    // anchor, an existing cut or a pending restore prevents the
+                    // optional snapshot. Only the destination is optional.
+                    if let Some(cut) = (r..next).find(|&i| {
+                        !self.verifying && self.slots[slot].cuts.contains(&(rows[i].2 as usize + 1))
+                    }) {
                         next = cut + 1;
                     }
                     chunks.extend([

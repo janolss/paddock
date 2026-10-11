@@ -754,14 +754,19 @@ mod budget_tests {
             images: vec![a.clone()],
             ..Default::default()
         };
-        assert!(super::retention::superseded(
-            &checkpoint,
-            &[1; 112],
-            &[a],
-            96
-        ));
+        let mut cache = [checkpoint, super::Checkpoint::default()];
+        assert_eq!(
+            super::retention::mark_anchor(&mut cache, &[1; 112], std::slice::from_ref(&b), 96),
+            None,
+            "same placeholder tokens cannot anchor different pixels"
+        );
+        assert_eq!(
+            super::retention::mark_anchor(&mut cache, &[1; 112], std::slice::from_ref(&a), 96),
+            Some(80)
+        );
+        assert!(super::retention::superseded(&cache[0], &[1; 112], &[a], 96));
         assert!(
-            !super::retention::superseded(&checkpoint, &[1; 112], &[b], 96),
+            !super::retention::superseded(&cache[0], &[1; 112], &[b], 96),
             "same placeholder tokens with different pixels are not a superseded branch"
         );
     }

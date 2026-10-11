@@ -78,6 +78,18 @@ fn image_rider_cap(cap: usize, decodes: usize, image_pending: bool, fresh_image:
 }
 
 impl Generator for Qwen35 {
+    fn anchor_at(&mut self, slot: usize, tokens: &[u32], upto: usize) {
+        let Some(slot) = self.slots.get(slot) else {
+            return;
+        };
+        // Only committed state for this token/image branch is eligible.
+        // The scheduler's prompt boundary excludes the pending decode token.
+        let upto = upto.min(slot.history.len()).min(tokens.len());
+        let images = slot.mm.as_ref().map_or(&[][..], |m| &m.keys);
+        if let Some(at) = retention::mark_anchor(&mut self.cache, tokens, images, upto) {
+            tracing::debug!(at, "Metal Qwen user-turn checkpoint anchored");
+        }
+    }
     fn tier_pump(&mut self) {
         self.pump_cold();
     }

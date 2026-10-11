@@ -81,17 +81,14 @@ impl Nemotron {
             first = end;
         }
         for &(slot, _, pos) in rows {
-            if self.slots[slot]
+            while self.slots[slot]
                 .table
                 .ensure(pos as usize, &mut self.pool)
                 .is_err()
             {
-                self.prefix.table.clear(&mut self.pool);
-                self.prefix.history.clear();
-                self.slots[slot]
-                    .table
-                    .ensure(pos as usize, &mut self.pool)
-                    .map_err(|_| MetalError::Memory("Nemotron KV pool exhausted".into()))?;
+                if !self.evict_prefix() {
+                    return Err(MetalError::Memory("Nemotron KV pool exhausted".into()));
+                }
             }
         }
         let mut pages = vec![0; self.slots.len() * self.page_stride];

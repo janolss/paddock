@@ -433,8 +433,7 @@ fn prepare(
         Some(v) if v.as_str() == Some("none") => tools = None,
         Some(v) if v.as_str() == Some("required") => forced_tool = Some(None),
         Some(v) if v.get("type").and_then(Value::as_str) == Some("function") => {
-            // Responses-flat {"type":"function","name":...}; the chat-nested
-            // form is accepted too
+            // Responses-flat {"type":"function","name":...}; the chat-nested form is accepted too
             let name = v
                 .get("name")
                 .or_else(|| v.get("function").and_then(|f| f.get("name")))
@@ -693,6 +692,7 @@ fn prepare(
         logit_bias: Vec::new(),
         // the OCR family's repetition guard (reference parity), off elsewhere
         no_repeat_ngram: ocr.as_ref().map_or((0, 0, false), |o| o.guard()),
+        reasoning: crate::reasoning::stop_policy(model, thinking_open),
     };
     Ok(Prepared {
         prompt_ids,

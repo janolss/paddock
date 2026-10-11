@@ -1919,6 +1919,7 @@ static const KernelTableV1 PD_KERNELS = {
     pd_dl_msda,
     pd_dl_ref_step,
     pd_dl_order_votes,
+    pd_stop_mask_rows,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

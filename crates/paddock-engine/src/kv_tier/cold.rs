@@ -2,7 +2,12 @@
 //! No file I/O, checksum scans, or channel waits occur on the inference thread.
 //! RAM includes queued jobs and completed-but-unconsumed reads, not only LRU entries.
 //! Device families own the resume schema and publish only after complete validation.
-use super::{TierStats, nvme_store::NvmeStore};
+use super::{
+    TierStats,
+    cost::{Calibration, CostModel},
+    nvme_store::NvmeStore,
+};
+mod calibration;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -54,10 +59,12 @@ impl Payload {
 enum Job {
     Store(Key, Arc<Payload>),
     Load(Key, Reservation),
+    Calibrate(Calibration),
 }
 enum Done {
     Stored(Key, usize, bool, Vec<Key>),
     Loaded(Key, Option<Arc<Payload>>, bool),
+    Calibrated(Calibration, bool),
 }
 struct Hot {
     payload: Arc<Payload>,
@@ -80,10 +87,27 @@ pub struct ColdCache {
     pub device_read_gbs: f64,
     disk_quota: u64,
     day: u64,
+    calibration: Option<calibration::State>,
 }
 impl ColdCache {
     /// Startup only. Opening/recovery failure is explicit, never silently disabled.
     pub fn open(config: ColdConfig, max_payload: usize) -> Result<Self, String> {
+        Self::open_inner(config, max_payload, None)
+    }
+    /// Reuse cost measurements only for this device and this locked cache
+    /// namespace. The first new live prefill still replaces the restored seed.
+    pub fn open_calibrated(
+        config: ColdConfig,
+        max_payload: usize,
+        device: &str,
+    ) -> Result<Self, String> {
+        Self::open_inner(config, max_payload, Some(device))
+    }
+    fn open_inner(
+        config: ColdConfig,
+        max_payload: usize,
+        device: Option<&str>,
+    ) -> Result<Self, String> {
         if config.ram_bytes == 0 || max_payload == 0 {
             return Err("KV offload requires a nonzero unified-RAM transfer budget".into());
         }
@@ -92,10 +116,18 @@ impl ColdCache {
         let mut disk_index = HashMap::new();
         let mut device_read_gbs = 0.0;
         let disk_quota = config.disk.as_ref().map_or(0, |(_, q)| *q);
+        let mut calibration = None;
         let store = config
             .disk
             .map(|(dir, quota)| {
                 let (store, recovery) = NvmeStore::open(&dir, quota).map_err(|e| e.to_string())?;
+                calibration = device.map(|device| calibration::State::load(store.dir(), device));
+                if let Some(c) = calibration.as_ref().and_then(|state| state.seed) {
+                    tracing::info!(
+                        prefill_tok_s = (c.prefill_tpus * 1e6).round(),
+                        "Metal KV cost model starts from this device's last calibration"
+                    );
+                }
                 tracing::info!(
                     recovered = recovery.recovered_entries,
                     "Metal KV cache recovered"
@@ -110,6 +142,7 @@ impl ColdCache {
             })
             .transpose()?;
         let worker = if let Some(mut store) = store {
+            let device = calibration.as_ref().map(|state| state.device.clone());
             Some(thread::Builder::new().name("paddock-kv-ssd".into()).spawn(move || {
                 while let Ok(job) = jobs.recv() {
                     let result = match job {
@@ -135,6 +168,17 @@ impl ColdCache {
                                 _ => Done::Loaded(key, None, false),
                             }
                         }
+                        Job::Calibrate(c) => {
+                            let saved = device.as_ref().is_some_and(|device| {
+                                if let Err(error) = calibration::save(store.dir(), device, c) {
+                                    tracing::debug!(%error, "Metal KV cost calibration not saved; cache remains usable");
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            Done::Calibrated(c, saved)
+                        }
                     };
                     if done.send(result).is_err() { break; }
                 }
@@ -159,6 +203,7 @@ impl ColdCache {
             device_read_gbs,
             disk_quota,
             day: utc_day(),
+            calibration,
         })
     }
     pub fn pump(&mut self) {
@@ -208,7 +253,36 @@ impl ColdCache {
                         }
                     }
                 }
+                Done::Calibrated(c, saved) => {
+                    if let Some(state) = &mut self.calibration {
+                        state.complete(c, saved);
+                    }
+                }
             }
+        }
+        self.save_calibration();
+    }
+    /// Startup-only seed, never fabricated from unmeasured defaults.
+    pub fn calibration(&self) -> Option<Calibration> {
+        self.calibration.as_ref().and_then(|state| state.seed)
+    }
+    /// Coalesces to one latest value and at most one queued write. Saturation
+    /// retries on a later pump; no file operation or channel wait here.
+    pub fn observe_cost(&mut self, cost: &CostModel) {
+        if let Some(state) = &mut self.calibration
+            && let Some(c) = cost.calibration()
+        {
+            state.observe(c);
+        }
+        self.save_calibration();
+    }
+    fn save_calibration(&mut self) {
+        let now = std::time::Instant::now();
+        if let (Some(state), Some(tx)) = (&mut self.calibration, &self.tx)
+            && let Some(c) = state.next(now)
+            && tx.try_send(Job::Calibrate(c)).is_ok()
+        {
+            state.submitted(now, c);
         }
     }
     fn insert_hot(&mut self, key: Key, payload: Arc<Payload>) {
@@ -364,6 +438,13 @@ impl ColdCache {
 }
 impl Drop for ColdCache {
     fn drop(&mut self) {
+        // Shutdown already joins this worker. Flush the last coalesced value
+        // without relaxing the write-rate bound during inference.
+        if let (Some(state), Some(tx)) = (&self.calibration, &self.tx)
+            && let Some(c) = state.shutdown_value()
+        {
+            let _ = tx.send(Job::Calibrate(c));
+        }
         self.tx.take();
         // Only model shutdown waits; normal scheduler methods never join/wait.
         if let Some(worker) = self.worker.take() {

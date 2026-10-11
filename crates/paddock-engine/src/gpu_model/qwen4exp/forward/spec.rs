@@ -293,9 +293,21 @@ impl Qwen4ExpGpu {
         let total: usize = runs.iter().map(|r| r.len).sum();
         let picks: Vec<u32> = {
             let Self {
-                exec, verify, cfg, ..
+                exec,
+                verify,
+                cfg,
+                stop,
+                ..
             } = self;
             let vf: &mut Verify = verify.as_mut().expect("built");
+            // the reasoning rows' stops masked before either pick
+            stop.launch(
+                exec,
+                &mut vf.logits,
+                0,
+                cfg.vocab,
+                &(0..total).collect::<Vec<_>>(),
+            )?;
             match plans {
                 None => exec.argmax_rows(&vf.logits, &mut vf.picks, total, cfg.vocab)?,
                 Some(plans) => {
@@ -364,13 +376,17 @@ impl Qwen4ExpGpu {
                 .picks
                 .try_slice(0..total)
                 .ok_or_else(|| GpuError::Driver("verify picks view".into()))?;
-            exec.stream
+            let picks = exec
+                .stream
                 .clone_dtoh(&view)
-                .map_err(crate::gpu::from_driver)?
+                .map_err(crate::gpu::from_driver)?;
+            stop.read(exec)?;
+            picks
         };
         let d_walk = t0.elapsed();
         // the service's accept walk, re-derived so the state commit can never
-        // disagree with the tokens it streams
+        // disagree with the tokens it streams - cut where a reasoning row's
+        // mask stops holding, as the service's walk cuts it
         let counts: Vec<usize> = runs
             .iter()
             .zip(reqs)
@@ -379,7 +395,7 @@ impl Qwen4ExpGpu {
                 while a + 1 < chunk.len() && chunk[a + 1] == picks[r.off + a] {
                     a += 1;
                 }
-                a + 1
+                a.min(self.stop.cut(r.off, &picks[r.off..r.off + chunk.len()])) + 1
             })
             .collect();
         self.verify_commit(&runs, &counts)?;

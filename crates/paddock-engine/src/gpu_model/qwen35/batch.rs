@@ -10,6 +10,8 @@ use crate::paged_radix::PagedRadix;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::sys::CUstreamCaptureMode;
 
+mod sampled;
+
 /// Max rows a tick may overdraw to absorb a prompt tail that would otherwise
 /// ride a whole extra tick (chunk-tail finding).
 /// Staged DeltaNet checkpoint blobs per tick (`d_ckpt_stage`): the number of
@@ -4440,31 +4442,6 @@ impl GpuQwen35 {
         Ok(out)
     }
 
-    /// True when the pack ships the fused row-sampling kernel - lets the
-    /// scheduler take `forward_batch_sampled` and skip the [B, vocab] readback.
-    /// K-quant models report false: the batched serving paths are Q8_0-class
-    /// until the stage-2 W4A8 kernels, so they serve on the serial spine.
-    pub fn supports_device_sampling(&self) -> bool {
-        // sampling reads d_logits - the k-quant W4A8 head fills the same buffer
-        self.exec.has_sample_rows()
-    }
-
-    /// `forward_batch` + fused on-device sampling (the gpt-oss path ported to
-    /// qwen35): `Device` rows come back as bare token ids (b × 4 bytes) instead
-    /// of the full `[b, vocab]` logits readback; `Host` rows (penalties,
-    /// constraints, logprobs) still get their own logits row copied back. The
-    /// sampling kernel is model-agnostic - it reads the same `d_logits` buffer
-    /// `forward_batch` fills, so this is bit-identical to host argmax on greedy
-    /// rows.
-    pub fn forward_batch_sampled(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        plans: &[crate::generator::RowSample],
-    ) -> Result<crate::generator::SampledStep, GpuModelError> {
-        self.batch_sampled_impl(tokens, positions, None, plans)
-    }
-
     /// Run `f` on the OVERLAP DECODE LANE when it is forked: `self.exec` is
     /// swapped to the lane for the duration, so every launch, htod, event and
     /// graph capture inside lands on the decode lane's streams (a cudarc
@@ -4493,253 +4470,6 @@ impl GpuQwen35 {
         );
         self.overlap_exec = Some(lane);
         r
-    }
-
-    /// `forward_batch_sampled` with an optional explicit slot mapping (see
-    /// `launch_batch_step_slots`). `None` = identity (pure decode); `Some` =
-    /// the mixed tick's compacted decode rows at arbitrary slots. Runs on the
-    /// overlap decode lane when forked.
-    fn batch_sampled_impl(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        slots: Option<&[u32]>,
-        plans: &[crate::generator::RowSample],
-    ) -> Result<crate::generator::SampledStep, GpuModelError> {
-        // Split decode tick (the c128 lane): every fast decode
-        // arm (mma_ks ladder, f8t plane, W8 tile class) is bounded b <= 64
-        // (pack guards + tile shapes), so a 65..128-row tick fell to slow
-        // eager lanes (~62ms vs 10.4ms at 64). At b > 64 any <=64 kernel
-        // needs two weight passes anyway - run the tick as <=64-row halves
-        // through the fast graphed path instead: rows are independent
-        // (per-slot KV/state, per-row glue/sampling), so per-row results
-        // are the 64-row tick's exact outputs. Requires explicit slots
-        // (identity mapping cannot survive a split); serve always passes
-        // them. Kill: PADDOCK_NO_DEC_SPLIT.
-        let b = tokens.len();
-        let bmax = f8t_dec_bmax();
-        if b > bmax && paddock_models::dev_var_os!("PADDOCK_NO_DEC_SPLIT").is_none() {
-            // identity mapping is materialized so the halves stay correct
-            // (the None fast path cannot survive a split) - this None case
-            // was the last b=128 hole: forward_batch_sampled passes None,
-            // and the first post-warmup tick captured the mma graph.
-            let ident: Vec<u32>;
-            let sl: &[u32] = match slots {
-                Some(s) => s,
-                None => {
-                    ident = (0..b as u32).collect();
-                    &ident
-                }
-            };
-            let mut ids = Vec::with_capacity(b);
-            let mut host_rows = Vec::new();
-            let mut b0 = 0usize;
-            while b0 < b {
-                let bn = (b - b0).min(bmax);
-                let step = self.with_decode_lane(|m| {
-                    m.batch_sampled_inner(
-                        &tokens[b0..b0 + bn],
-                        &positions[b0..b0 + bn],
-                        Some(&sl[b0..b0 + bn]),
-                        &plans[b0..b0 + bn],
-                    )
-                })?;
-                ids.extend(step.ids);
-                host_rows.extend(step.host_rows.into_iter().map(|(r, l)| (r + b0, l)));
-                b0 += bn;
-            }
-            return Ok(crate::generator::SampledStep { ids, host_rows });
-        }
-        self.with_decode_lane(|m| m.batch_sampled_inner(tokens, positions, slots, plans))
-    }
-
-    fn batch_sampled_inner(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        slots: Option<&[u32]>,
-        plans: &[crate::generator::RowSample],
-    ) -> Result<crate::generator::SampledStep, GpuModelError> {
-        use crate::generator::{RowSample, SampledStep};
-        use crate::sampler::DevicePlan;
-        let exec = self.exec.clone();
-        let vocab = self.vocab;
-        let b = tokens.len();
-        assert_eq!(plans.len(), b, "one plan per row");
-        // pack per-row sampler params; the kernel skips mode-0 rows (holes AND
-        // host rows - the host reads the latter's logits itself)
-        // small-b: the one-block-per-row prefilter is DRAM-latency-bound
-        // (c1 -13% pre-fallback); the classic full-row readback + host
-        // top-64 is cheaper there and distribution-identical
-        let small_b = b <= 2;
-        // P67: full-device sampling (mode 5) whenever the pack ships slot
-        // 435 - the token lands in d_samp_out like modes 1/2, no head
-        // readback, no host tail. Old packs keep mode 4 (host-head).
-        let dev_full = !small_b && exec.has_sample_rows_t();
-        let mut par = vec![0u32; b * 4];
-        let mut tpar = vec![0u32; b * 4];
-        let mut any_trunc = false;
-        let mut any_base = false;
-        for (i, p) in plans.iter().enumerate() {
-            match p {
-                RowSample::Hole | RowSample::Host => {}
-                RowSample::Device(DevicePlan::Greedy) => {
-                    par[i * 4 + 2] = 1;
-                    any_base = true;
-                }
-                RowSample::Device(DevicePlan::Categorical { inv_t, u }) => {
-                    par[i * 4] = inv_t.to_bits();
-                    par[i * 4 + 1] = u.to_bits();
-                    par[i * 4 + 2] = 2;
-                    any_base = true;
-                }
-                RowSample::Device(DevicePlan::TruncCat {
-                    inv_t,
-                    u,
-                    k,
-                    top_p,
-                    min_p,
-                }) => {
-                    par[i * 4] = inv_t.to_bits();
-                    par[i * 4 + 1] = u.to_bits();
-                    par[i * 4 + 2] = if dev_full { 5 } else { 4 };
-                    tpar[i * 4] = *k;
-                    tpar[i * 4 + 1] = top_p.to_bits();
-                    tpar[i * 4 + 2] = min_p.to_bits();
-                    any_trunc = true;
-                }
-                // RS plans are gemma4-only (supports_spec_rs); skip-safe
-                RowSample::Device(DevicePlan::RsVerify { .. })
-                | RowSample::Device(DevicePlan::RsTrunc { .. }) => {}
-            }
-        }
-        let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
-        {
-            let bs = self.batch.as_mut().ok_or(GpuModelError::BatchDisabled)?;
-            let mut v = bs.d_samp_par.slice_mut(0..b * 4);
-            exec.stream.memcpy_htod(&par, &mut v).map_err(drv)?;
-            if any_trunc && dev_full {
-                let mut t = bs.d_samp_tpar.slice_mut(0..b * 4);
-                exec.stream.memcpy_htod(&tpar, &mut t).map_err(drv)?;
-            }
-        }
-        self.launch_batch_step_slots(tokens, positions, slots)?;
-        // DFlash: this tick's rows just walked (taps baked in the step
-        // graph) - fuse and ring-append before the ids readback syncs.
-        if self.dflash.as_ref().is_some_and(|d| d.state.is_some()) && !super::dflash::fuse_off() {
-            let ident: Vec<u32>;
-            let slots_v: &[u32] = match slots {
-                Some(s) => s,
-                None => {
-                    ident = (0..b as u32).collect();
-                    &ident
-                }
-            };
-            self.dflash_append_features(tokens, positions, slots_v, None)?;
-        }
-        // stage F: the rows' states advanced in this pass (stream-ordered
-        // behind it, ahead of the ids readback below)
-        self.reply_after_rows(tokens, positions, slots)?;
-        let bs = self.batch.as_mut().ok_or(GpuModelError::BatchDisabled)?;
-        // folded launches: this site writes mode 5 for every trunc row (no
-        // mode 6 exists here), so the p chain was 11 launches of nothing
-        let fold_off = Self::samp_fold_off();
-        if any_base || fold_off {
-            exec.sample_rows(&bs.d_logits, &bs.d_samp_par, &mut bs.d_samp_out, b, vocab)?;
-        }
-        if any_trunc && dev_full {
-            // engagement witness (bisect-trap law): once per process
-            static DEV5: std::sync::Once = std::sync::Once::new();
-            DEV5.call_once(|| {
-                eprintln!("[trunc-dev5] engaged: b={b} (full-device truncation sampling)");
-            });
-            Self::samp_fold_witness(any_base, true, false);
-            exec.sample_rows_t(
-                &bs.d_logits,
-                &bs.d_samp_par,
-                &bs.d_samp_tpar,
-                &mut bs.d_samp_out,
-                b,
-                vocab,
-            )?;
-            if fold_off {
-                exec.sample_rows_p(
-                    &bs.d_logits,
-                    &bs.d_samp_par,
-                    &bs.d_samp_tpar,
-                    &mut bs.d_samp_out,
-                    b,
-                    vocab,
-                )?;
-            }
-        } else if any_trunc && !small_b {
-            exec.topk_rows(
-                &bs.d_logits,
-                &bs.d_samp_par,
-                &mut bs.d_samp_head,
-                b,
-                vocab,
-                64,
-            )?;
-        }
-        let ids_view = bs
-            .d_samp_out
-            .try_slice(0..b)
-            .ok_or_else(|| GpuError::Driver("samp_out slice out of range".into()))?;
-        let mut ids = exec
-            .stream
-            .clone_dtoh(&ids_view)
-            .map_err(|e| GpuError::Driver(e.to_string()))?;
-        if any_trunc && dev_full {
-            // mode 5: ids already carry the device-sampled tokens
-        } else if any_trunc && !small_b {
-            let hv = bs
-                .d_samp_head
-                .try_slice(0..b * 128)
-                .ok_or_else(|| GpuError::Driver("samp_head slice out of range".into()))?;
-            let head = exec
-                .stream
-                .clone_dtoh(&hv)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
-            trunc_fill_ids(&head, plans, &mut ids);
-        } else if any_trunc {
-            for (i, p) in plans.iter().enumerate() {
-                if let RowSample::Device(DevicePlan::TruncCat {
-                    inv_t,
-                    u,
-                    k,
-                    top_p,
-                    min_p,
-                }) = *p
-                {
-                    let view = bs
-                        .d_logits
-                        .try_slice(i * vocab..(i + 1) * vocab)
-                        .ok_or_else(|| GpuError::Driver("logits row slice out of range".into()))?;
-                    let row = exec
-                        .stream
-                        .clone_dtoh(&view)
-                        .map_err(|e| GpuError::Driver(e.to_string()))?;
-                    let head = host_top64(&row);
-                    ids[i] = crate::sampler::sample_trunc_head(&head, inv_t, u, k, top_p, min_p);
-                }
-            }
-        }
-        let mut host_rows = Vec::new();
-        for (i, p) in plans.iter().enumerate() {
-            if matches!(p, RowSample::Host) {
-                let view = bs
-                    .d_logits
-                    .try_slice(i * vocab..(i + 1) * vocab)
-                    .ok_or_else(|| GpuError::Driver("logits row slice out of range".into()))?;
-                let row = exec
-                    .stream
-                    .clone_dtoh(&view)
-                    .map_err(|e| GpuError::Driver(e.to_string()))?;
-                host_rows.push((i, row));
-            }
-        }
-        Ok(SampledStep { ids, host_rows })
     }
 
     /// P65: the host-head sampling finish is wired (TruncCat plans legal)
@@ -8301,6 +8031,10 @@ impl GpuQwen35 {
                     exec.stream.memcpy_htod(&tpar, &mut t).map_err(drv)?;
                 }
             }
+            // the decode rows [0, b) are the call rows the service's stop
+            // masks index (the finishers after them carry none)
+            let at: Vec<usize> = (0..b).collect();
+            self.stop.launch(&exec, &mut bs.d_logits, 0, vocab, &at)?;
             let fold_off = Self::samp_fold_off();
             if any_base || fold_off {
                 exec.sample_rows(&bs.d_logits, &bs.d_samp_par, &mut bs.d_samp_out, tot, vocab)?;

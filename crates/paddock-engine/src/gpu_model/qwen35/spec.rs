@@ -4676,6 +4676,7 @@ impl GpuQwen35 {
         let tv = std::time::Instant::now();
         self.spec_chain_stage_lens(reqs);
         self.forward_chunk_b(&padded)?;
+        self.spec_stop_mask(reqs, k1, true)?;
         let picks_all = self
             .exec
             .to_host_u32(&self.spec_batch.as_ref().expect("spec batch").d_row_tok)?;
@@ -4684,17 +4685,7 @@ impl GpuQwen35 {
         // acceptance identical to the service rule, over the real chunk only
         // (walk `padded` - identical values to reqs on sync rounds, the real
         // chain ids on armed async rounds)
-        let mut committed: Vec<u32> = Vec::with_capacity(n);
-        let mut picks_out: Vec<u32> = Vec::new();
-        for (i, (_, _, chunk)) in reqs.iter().enumerate() {
-            let base = i * k1;
-            let mut a = 0usize;
-            while a + 1 < chunk.len() && padded[base + a + 1] == picks_all[base + a] {
-                a += 1;
-            }
-            committed.push((a + 1) as u32);
-            picks_out.extend_from_slice(&picks_all[base..base + chunk.len()]);
-        }
+        let (committed, picks_out) = self.spec_walk(reqs, &padded, &picks_all, k1)?;
         if paddock_models::dev_var_os!("PADDOCK_SPEC_TRACE").is_some() {
             // token-level round trace (from the contamination hunt): the
             // serving round only logged counts, which cannot say WHOSE tokens
@@ -4898,6 +4889,7 @@ impl GpuQwen35 {
         };
         self.spec_chain_stage_lens(reqs);
         self.forward_chunk_b(&padded)?;
+        self.spec_stop_mask(reqs, k1, false)?;
         let exec = self.exec.clone();
         let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
         {
@@ -4993,19 +4985,9 @@ impl GpuQwen35 {
                 .d_samp_out_chunk,
         )?;
         self.spec_chain_rebuild(&mut padded, reqs, k1)?;
-        let mut committed: Vec<u32> = Vec::with_capacity(n);
-        let mut picks_out: Vec<u32> = Vec::new();
         // accept walks `padded` - identical to reqs on sync rounds, the real
         // chain ids on armed async rounds (placeholders never accept-match)
-        for (i, (_, _, chunk)) in reqs.iter().enumerate() {
-            let base = i * k1;
-            let mut a = 0usize;
-            while a + 1 < chunk.len() && padded[base + a + 1] == picks_all[base + a] {
-                a += 1;
-            }
-            committed.push((a + 1) as u32);
-            picks_out.extend_from_slice(&picks_all[base..base + chunk.len()]);
-        }
+        let (committed, picks_out) = self.spec_walk(reqs, &padded, &picks_all, k1)?;
         self.commit_chunk_b(&padded, &committed)?;
         if self.spec_round_dflash && self.dflash_armed() {
             // drafter state is the feature ring: append the ACCEPTED rows'

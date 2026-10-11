@@ -20,13 +20,18 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::generator::{CanvasStatus, CanvasTickReq, FinishSample, GenError, Generator, RowSample};
 use crate::metrics::{EngineMetrics, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
-use crate::sampler::{Sampler, SamplingParams, TokenConstraint, compute_logprobs};
+use crate::sampler::{
+    Sampler, SamplingParams, TokenConstraint, compute_logprobs, pick_next, pick_verify_row,
+};
 use crate::spec::NgramDraft;
 use crate::spec_policy::{RoundTally, SpecController, SpecPolicy, synchronous_draft_budget};
 
+mod commit;
+mod dump;
+use commit::{commit_device_token, sample_slot_row, send_stop_masks, send_verify_masks};
 mod finish;
 mod timing;
-pub use finish::FinishReason;
+pub use finish::{FinishReason, next_event};
 
 /// Serving spec-decode row budget per round: total rows (1 pending + drafts
 /// per slot) must fit the models' verify-pass cap. Default 32 matches
@@ -470,37 +475,6 @@ pub struct TokenLogprobs {
     pub chosen: f32,
     /// top alternatives, (token id, logprob), probability-descending
     pub top: Vec<(u32, f32)>,
-}
-
-/// One constrained (or plain) sampling step: stop tokens are legal only when
-/// the constraint says the output may end; the accepted token advances it.
-/// Err = the constraint has no legal continuation (grammar deadlock).
-fn pick_next(
-    sampler: &mut Sampler,
-    logits: &mut [f32],
-    history: &[u32],
-    constraint: &mut Option<Box<dyn TokenConstraint>>,
-    stop_tokens: &[u32],
-) -> Result<u32, String> {
-    match constraint {
-        None => Ok(sampler.sample(logits, history)),
-        Some(c) => {
-            let may_stop = c.may_stop();
-            let next = sampler
-                .sample_constrained(logits, history, &mut |id| {
-                    if stop_tokens.contains(&id) {
-                        may_stop
-                    } else {
-                        c.allows(id)
-                    }
-                })
-                .ok_or("constraint deadlock: no legal next token")?;
-            if !stop_tokens.contains(&next) {
-                c.accept(next);
-            }
-            Ok(next)
-        }
-    }
 }
 
 /// One piece of a multimodal prompt.
@@ -1369,6 +1343,7 @@ impl Engine {
 
     pub fn submit(&self, mut req: GenRequest) -> Result<(), String> {
         req.submitted.get_or_insert_with(std::time::Instant::now);
+        dump::tap(&mut req);
         self.tx
             .send(req)
             .map_err(|_| "engine thread is gone".to_owned())
@@ -1380,8 +1355,7 @@ impl Engine {
     }
 }
 
-/// Resets the engine phase/slot counters to idle when a serial request exits by
-/// any path (done, error, client hang-up).
+/// Resets the phase/slot counters to idle when a serial request exits (done, error, hang-up).
 struct IdleOnDrop<'a>(&'a EngineMetrics);
 impl Drop for IdleOnDrop<'_> {
     fn drop(&mut self) {
@@ -2893,8 +2867,7 @@ fn finish_prefill(
     if !slot.accept(next, lp) {
         slots[k] = None;
     } else {
-        // seed the drafter: prompt + first token (history holds exactly
-        // that after accept)
+        // seed the drafter: prompt + first token (history holds exactly that after accept)
         for i in 0..slot.history.len() {
             let t = slot.history[i];
             slot.draft.push(t);
@@ -3108,9 +3081,10 @@ fn debit_pool_budget(budget: &mut Option<usize>, req: &GenRequest) {
 fn admit(
     slots: &mut [Option<Slot>],
     req: GenRequest,
-    max_ctx: usize,
+    generator: &dyn Generator,
     metrics: &Arc<EngineMetrics>,
 ) -> bool {
+    let max_ctx = generator.max_context();
     if paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some() {
         tracing::info!(
             queued_ms = req.submitted.map(|t| t.elapsed().as_secs_f64() * 1000.),
@@ -3153,7 +3127,13 @@ fn admit(
     req.max_tokens = req.max_tokens.min(room);
     for s in slots.iter_mut() {
         if s.is_none() {
-            *s = Some(Slot::new(req, metrics.clone()));
+            let mut slot = Slot::new(req, metrics.clone());
+            // a backend that masks stops on device keeps a reasoning reply's
+            // device plans (sampler/reasoning.rs)
+            if generator.supports_stop_mask() {
+                slot.sampler.arm_stop_mask(&slot.stop_tokens);
+            }
+            *s = Some(slot);
             return true;
         }
     }
@@ -3744,7 +3724,7 @@ fn run_batched(
         let active = slots.iter().filter(|s| s.is_some()).count();
         if ctl.stop_requested() {
             tracing::info!("engine: shutdown requested - leaving the scheduler ({active} live)");
-            return;
+            return finish::fail_held_requests(&mut slots, &mut preempted, mm_pending.take(), rx);
         }
         // Straggler self-report: one full iteration (admission + tick body)
         // took `tick_wall`. active > 0 keeps legit quiet paths (mm exclusive
@@ -3924,7 +3904,7 @@ fn run_batched(
                 }
                 Ok(req) => {
                     debit_pool_budget(&mut admit_budget, &req);
-                    admit(&mut slots, req, generator.max_context(), metrics);
+                    admit(&mut slots, req, &*generator, metrics);
                     admitted_now += 1;
                     ticks_since_admit = 0;
                     // a fresh prefill re-warms the draft head - make spec
@@ -4013,7 +3993,7 @@ fn run_batched(
                 }
                 Ok(req) => {
                     debit_pool_budget(&mut admit_budget, &req);
-                    admit(&mut slots, req, generator.max_context(), metrics);
+                    admit(&mut slots, req, &*generator, metrics);
                     admitted_now += 1;
                     {
                         ticks_since_admit = 0;
@@ -4075,7 +4055,7 @@ fn run_batched(
                     }
                     Ok(req) => {
                         debit_pool_budget(&mut admit_budget, &req);
-                        admit(&mut slots, req, generator.max_context(), metrics);
+                        admit(&mut slots, req, &*generator, metrics);
                         ticks_since_admit = 0;
                         spec_retry_at = spec_ticks;
                         quiet = std::time::Instant::now();
@@ -4677,6 +4657,7 @@ fn run_batched(
                             && s.sampler.is_trunc_plannable()))
                         && s.constraint.is_none()
                         && s.logprobs.is_none()
+                        && !s.sampler.in_reasoning() // no stop mask on mixed-spec rows
                 });
             // requests in flight (chunking + decoding) - the pipe_min_live floor
             let live_slots = slots.iter().filter(|s| s.is_some()).count();
@@ -4689,6 +4670,7 @@ fn run_batched(
                     let s = slots[k].as_ref().expect("live decode row");
                     s.constraint.is_none()
                         && s.logprobs.is_none()
+                        && !s.sampler.in_reasoning() // the pipe carries no stop mask
                         && (s.sampler.is_device_plannable()
                             || (trunc_pipe_ok && s.sampler.is_trunc_plannable()))
                 })
@@ -4839,7 +4821,7 @@ fn run_batched(
                                     st_ovl += 1;
                                     for (i, &(k, _, _)) in dec.iter().enumerate() {
                                         if matches!(prev_plans[i], RowSample::Device(_)) {
-                                            commit_device_token(&mut slots[k], ids[i]);
+                                            commit_device_token(&mut slots[k], ids[i], false);
                                         }
                                     }
                                     prev_plans = next_plans;
@@ -4866,7 +4848,7 @@ fn run_batched(
                                 Ok(ids) => {
                                     for (i, &(k, _, _)) in dec.iter().enumerate() {
                                         if matches!(prev_plans[i], RowSample::Device(_)) {
-                                            commit_device_token(&mut slots[k], ids[i]);
+                                            commit_device_token(&mut slots[k], ids[i], false);
                                         }
                                     }
                                 }
@@ -4978,6 +4960,7 @@ fn run_batched(
                         || (generator.supports_device_trunc() && s.sampler.is_trunc_plannable()))
                         && s.constraint.is_none()
                         && s.logprobs.is_none()
+                        && !s.sampler.in_reasoning() // no stop mask on mixed-spec rows
                 })
             {
                 // PER-SLOT warmth (all-or-nothing never engaged under
@@ -5523,6 +5506,7 @@ fn run_batched(
                     crate::pacing::TickKind::Mixed
                 };
                 let nd = dec.len();
+                send_stop_masks(generator, &plans, |i| slots[dec[i].0].as_ref());
                 let mixed_result =
                     match pacers.begin(kind, generator, nd, nd, mixed_tick_budget(nd), nd) {
                         Err(e) => Err(e),
@@ -5538,6 +5522,7 @@ fn run_batched(
                             r
                         }
                     };
+                let pr = generator.take_stop_pressure();
                 match mixed_result {
                     Ok((step, finished)) => {
                         if crate::tickseg::on() {
@@ -5549,7 +5534,11 @@ fn run_batched(
                             match plans[i] {
                                 RowSample::Hole => {}
                                 RowSample::Device(_) => {
-                                    commit_device_token(&mut slots[k], step.ids[i]);
+                                    commit_device_token(
+                                        &mut slots[k],
+                                        step.ids[i],
+                                        pr.get(i) == Some(&true),
+                                    );
                                 }
                                 RowSample::Host => {
                                     let (_, mut row) = host_rows.next().expect("host row");
@@ -5907,11 +5896,14 @@ fn run_batched(
                 // still run: the verify re-points cold slots' heads.)
                 let nothing_to_verify =
                     !generator.spec_capable() && reqs.iter().all(|r| r.2.len() == 1);
-                match if nothing_to_verify {
+                let res = if nothing_to_verify {
                     Ok(None)
                 } else {
+                    send_verify_masks(generator, &slots, &reqs);
                     generator.forward_spec_batch(&reqs)
-                } {
+                };
+                let pr = generator.take_stop_pressure();
+                match res {
                     Ok(Some(picks)) => {
                         let mut base = 0usize;
                         let mut accs: Vec<usize> = Vec::with_capacity(live.len());
@@ -5924,6 +5916,9 @@ fn run_batched(
                                 while a + 1 < chunk.len() && chunk[a + 1] == picks[base + a] {
                                     a += 1;
                                 }
+                                // where a reasoning row's mask stops holding
+                                let pr = pr.get(base..).unwrap_or(&[]);
+                                let a = slot.sampler.walk_device_run(&picks[base..=base + a], pr);
                                 accs.push(a + 1);
                                 if chunk.len() > 1 {
                                     if a == chunk.len() - 1 {
@@ -6168,7 +6163,12 @@ fn run_batched(
                     // available run STRIP mode - the accept-while-match walk
                     // happens on device, one compact strip comes back, and
                     // the fill + replay below never run.
-                    if async_k.is_some() && generator.supports_spec_strip() {
+                    // the strip's accept runs on device, where a reasoning
+                    // slot's walk cannot be cut (sampler/reasoning.rs)
+                    let in_block = live
+                        .iter()
+                        .any(|&k| slots[k].as_ref().is_some_and(|s| s.sampler.in_reasoning()));
+                    if async_k.is_some() && generator.supports_spec_strip() && !in_block {
                         match generator.forward_spec_batch_strip(&reqs, &plans) {
                             Ok(Some(strip)) => {
                                 let mut dead: Vec<usize> = Vec::new();
@@ -6398,7 +6398,7 @@ fn run_batched(
                                     }
                                     if let Some(req) = pipe_admit {
                                         debit_pool_budget(&mut admit_budget, &req);
-                                        admit(&mut slots, req, generator.max_context(), metrics);
+                                        admit(&mut slots, req, &*generator, metrics);
                                         ticks_since_admit = 0;
                                     }
                                 }
@@ -6424,7 +6424,10 @@ fn run_batched(
                             }
                         }
                     } else {
-                        match generator.forward_spec_batch_plans(&reqs, &plans) {
+                        send_verify_masks(generator, &slots, &reqs);
+                        let res = generator.forward_spec_batch_plans(&reqs, &plans);
+                        let pr = generator.take_stop_pressure();
+                        match res {
                             Ok(Some(picks)) => {
                                 // async round: fill the placeholder chunks with
                                 // the real drafts (fetched post-verify - the
@@ -6459,6 +6462,9 @@ fn run_batched(
                                     while a + 1 < chunk.len() && chunk[a + 1] == picks[base + a] {
                                         a += 1;
                                     }
+                                    let pr = pr.get(base..).unwrap_or(&[]);
+                                    let a =
+                                        slot.sampler.walk_device_run(&picks[base..=base + a], pr);
                                     if chunk.len() > 1 {
                                         if a == chunk.len() - 1 {
                                             slot.k_now = (slot.k_now * 2).min(serve_spec_max_k());
@@ -6619,57 +6625,21 @@ fn run_batched(
                                     // sample rows until the first mismatch -
                                     // that row's sample is the replacement
                                     let mut picks: Vec<u32> = Vec::with_capacity(chunk.len());
-                                    let mut deadlock = false;
                                     for j in 0..chunk.len() {
                                         let row = &mut rows
                                             [(base_row + j) * vocab..(base_row + j + 1) * vocab];
-                                        // Constrained slots sample each verify
-                                        // pick through the machine - literally
-                                        // pick_next's semantics at the verify
-                                        // position, with the draft row as the
-                                        // free acceleration. Free phases cost
-                                        // nothing (allows() is all-true); in a
-                                        // grammar region the pick is legal by
-                                        // construction and drafts that violate
-                                        // it simply mismatch and cut the run.
-                                        let t = match slot.constraint.as_mut() {
-                                            Some(c) => {
-                                                let may_stop = c.may_stop();
-                                                let stops = &slot.stop_tokens;
-                                                match slot.sampler.sample_constrained(
-                                                    row,
-                                                    &[],
-                                                    &mut |id| {
-                                                        if stops.contains(&id) {
-                                                            may_stop
-                                                        } else {
-                                                            c.allows(id)
-                                                        }
-                                                    },
-                                                ) {
-                                                    Some(t) => t,
-                                                    None => {
-                                                        // Grammar deadlock -
-                                                        // unreachable for live
-                                                        // machines. Emit the
-                                                        // unconstrained pick
-                                                        // without advancing the
-                                                        // machine and end the
-                                                        // run: the next dense
-                                                        // step hits pick_next's
-                                                        // own deadlock error
-                                                        // and fails the request
-                                                        // properly. No novel
-                                                        // 0-commit rollback
-                                                        // path, no contract
-                                                        // bend.
-                                                        deadlock = true;
-                                                        slot.sampler.sample(row, &[])
-                                                    }
-                                                }
-                                            }
-                                            None => slot.sampler.sample(row, &[]),
-                                        };
+                                        // Every pick goes through pick_next's semantics
+                                        // at the verify position (sampler/reasoning.rs):
+                                        // a constrained slot's machine, the
+                                        // reasoning-stop policy, the draft row as free
+                                        // acceleration - drafts that violate either
+                                        // simply mismatch and cut the run.
+                                        let (t, deadlock) = pick_verify_row(
+                                            &mut slot.sampler,
+                                            row,
+                                            slot.constraint.as_deref(),
+                                            &slot.stop_tokens,
+                                        );
                                         picks.push(t);
                                         if deadlock {
                                             break;
@@ -6860,7 +6830,12 @@ fn run_batched(
                 // chunking a prompt needs the outer loop, which a segment only
                 // returns to on an arrival - 64 page requests admitted at once
                 // left 62 encodes waiting on two decoders forever
-                && slots[..high_water].iter().flatten().all(|s| s.prefilled)
+                // ...and none inside a reasoning block: the pipe carries no
+                // stop mask (sampler/reasoning.rs)
+                && slots[..high_water]
+                    .iter()
+                    .flatten()
+                    .all(|s| s.prefilled && !s.sampler.in_reasoning())
                 && ticks_since_admit >= pipe_min_quiet.saturating_add(pipe_backoff)
                 // host-head TruncCat cannot ride the zero-host pipe;
                 // full-device (mode 5) TruncCat can
@@ -7024,7 +6999,7 @@ fn run_batched(
                                 let Some(req) = admit_req.take() else { break };
                                 let free_k = slots.iter().position(|s| s.is_none());
                                 debit_pool_budget(&mut admit_budget, &req);
-                                admit(&mut slots, req, generator.max_context(), metrics);
+                                admit(&mut slots, req, &*generator, metrics);
                                 {
                                     ticks_since_admit = 0;
                                 }
@@ -7096,7 +7071,7 @@ fn run_batched(
                             Ok(ids) => {
                                 for (k, plan) in prev_plans.iter().enumerate() {
                                     if matches!(plan, RowSample::Device(_)) {
-                                        commit_device_token(&mut slots[k], ids[k]);
+                                        commit_device_token(&mut slots[k], ids[k], false);
                                     }
                                 }
                             }
@@ -7116,7 +7091,7 @@ fn run_batched(
                                 mm_pending = Some(req);
                             } else {
                                 debit_pool_budget(&mut admit_budget, &req);
-                                admit(&mut slots, req, generator.max_context(), metrics);
+                                admit(&mut slots, req, &*generator, metrics);
                                 {
                                     ticks_since_admit = 0;
                                 }
@@ -7136,7 +7111,7 @@ fn run_batched(
                             let mut died = false;
                             for (k, plan) in prev_plans.iter().enumerate() {
                                 if matches!(plan, RowSample::Device(_)) {
-                                    commit_device_token(&mut slots[k], ids[k]);
+                                    commit_device_token(&mut slots[k], ids[k], false);
                                     if slots[k].is_none() {
                                         died = true;
                                     }
@@ -7169,7 +7144,7 @@ fn run_batched(
                                     Ok(ids) => {
                                         for (k, plan) in prev_plans.iter().enumerate() {
                                             if matches!(plan, RowSample::Device(_)) {
-                                                commit_device_token(&mut slots[k], ids[k]);
+                                                commit_device_token(&mut slots[k], ids[k], false);
                                             }
                                         }
                                     }
@@ -7210,7 +7185,10 @@ fn run_batched(
             }
             let seg_t = std::time::Instant::now();
             let t0 = std::time::Instant::now();
-            match generator.forward_batch_sampled(&tokens, &positions, &plans) {
+            send_stop_masks(generator, &plans, |k| slots[k].as_ref());
+            let res = generator.forward_batch_sampled(&tokens, &positions, &plans);
+            let pr = generator.take_stop_pressure();
+            match res {
                 Ok(step) => {
                     st[2].0 += 1;
                     st[2].1 += t0.elapsed().as_nanos() as u64;
@@ -7224,7 +7202,11 @@ fn run_batched(
                         match plan {
                             RowSample::Hole => {}
                             RowSample::Device(_) => {
-                                commit_device_token(&mut slots[k], step.ids[k]);
+                                commit_device_token(
+                                    &mut slots[k],
+                                    step.ids[k],
+                                    pr.get(k) == Some(&true),
+                                );
                             }
                             RowSample::Host => {
                                 let (i, mut row) = host_rows.next().expect("host row");
@@ -7358,66 +7340,6 @@ fn sample_threads() -> usize {
             .filter(|&n| n >= 1)
             .unwrap_or(12)
     })
-}
-
-/// Commit a device-sampled token (the phase-3 body for GPU-picked rows: no
-/// host logits exist - constraint/logprob slots never take this path).
-fn commit_device_token(slot_opt: &mut Option<Slot>, next: u32) {
-    let Some(slot) = slot_opt.as_mut() else {
-        return;
-    };
-    // A slot with no KV behind it has no token to commit - whatever came back
-    // for its row is a hole. Guarded here as well as at the plan, because the
-    // plan is built in several places and this is the one door they all use.
-    if !slot.prefilled {
-        return;
-    }
-    slot.pos += 1; // the pending token is now committed at its position
-    slot.draft.push(next);
-    if !slot.accept(next, None) {
-        *slot_opt = None;
-    }
-}
-
-/// Sample + commit one slot's next token from its decode-tick logits row
-/// (the phase-3 body, shared by the serial and scoped-thread paths).
-fn sample_slot_row(slot_opt: &mut Option<Slot>, row: &mut [f32]) {
-    let Some(slot) = slot_opt.as_mut() else {
-        return;
-    };
-    // Same guard as `commit_device_token`: an unprefilled slot's row is a hole,
-    // and sampling it would stream a token drawn from nothing.
-    if !slot.prefilled {
-        return;
-    }
-    slot.pos += 1; // the pending token is now committed at its position
-    let raw = slot.logprobs.map(|_| row.to_vec());
-    let next = match pick_next(
-        &mut slot.sampler,
-        row,
-        &slot.history,
-        &mut slot.constraint,
-        &slot.stop_tokens,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = slot
-                .events
-                .send(TokenEvent::Error(EngineError::internal(&e)));
-            *slot_opt = None;
-            return;
-        }
-    };
-    let lp = slot
-        .logprobs
-        .map(|n| compute_logprobs(raw.as_ref().expect("snapshot"), next, n));
-    // keep the drafter's history gapless even on dense ticks (a
-    // greedy slot may ride spec rounds later; gapped history only
-    // degrades proposals, but why degrade)
-    slot.draft.push(next);
-    if !slot.accept(next, lp) {
-        *slot_opt = None;
-    }
 }
 
 #[cfg(test)]

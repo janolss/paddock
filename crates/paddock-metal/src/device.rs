@@ -213,6 +213,16 @@ pub struct MetalDevice {
 }
 
 impl MetalDevice {
+    /// Performance seeds belong to this GPU/driver and kernel family, not
+    /// just a model filename. A mismatch safely starts with generic costs.
+    pub(crate) fn calibration_device(&self) -> String {
+        format!(
+            "metal:{}:registry={}:tensor={}",
+            self.checkpoint_platform(),
+            self.raw.registryID(),
+            self.tensor_accelerated
+        )
+    }
     /// Driver/compiler changes can change recurrent arithmetic even when the
     /// checkpoint layout is unchanged. Never reuse those states across them.
     pub(crate) fn checkpoint_platform(&self) -> String {
@@ -1031,6 +1041,13 @@ impl MetalDevice {
             "q4a_expert_mm_group32",
             "q4a_expert_mm_group32_pad",
             "q4a_expert_mm_group32_packed",
+            "q4a_expert_mm_hoisted",
+            #[cfg(test)]
+            "q4a_expert_mm_locality2",
+            #[cfg(test)]
+            "q4a_expert_mm_locality4",
+            #[cfg(test)]
+            "q4a_expert_mm_locality4_hoisted",
             #[cfg(test)]
             "q4a_expert_mm_k128_n32",
             #[cfg(test)]

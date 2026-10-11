@@ -424,8 +424,7 @@ fn elected_checkpoint_lifecycle() {
     close(&cold, &resumed, 0.00001);
     // Independent serial GPU state recurrence versus matrix SSD, same dense
     // and expert projections. Neither graph is a CPU reference model.
-    m.prefix.table.clear(&mut m.pool);
-    m.prefix.history.clear();
+    while m.evict_prefix() {}
     m.reset();
     m.scan_only = true;
     let serial = m.prefill(0, &prompt[..145]).unwrap();
@@ -478,9 +477,11 @@ fn elected_checkpoint_lifecycle() {
     assert!(m.prefill(4, &[1]).is_err());
     assert!(m.prefill(0, &[VOCAB as u32]).is_err());
     m.release_inactive_slots(&[]);
-    m.prefix.table.clear(&mut m.pool);
-    m.prefix.history.clear();
-    assert_eq!(m.pool.free_blocks(), m.page_stride * 5);
+    while m.evict_prefix() {}
+    assert_eq!(
+        m.pool.free_blocks(),
+        m.page_stride * (4 + PREFIX_PER_SLOT * 4)
+    );
     assert_eq!(m.device.allocated_bytes(), used);
     m.reset();
     let first = m.forward(17).unwrap();

@@ -76,6 +76,8 @@ pub use sam3_memory::Sam3MemDownIn;
 pub use sam3_tracker::{Mlp3, Sam3MaskDownOut};
 pub use sam3_video::{Sam3Resize, pil_ksize};
 mod sampling;
+mod stop_mask;
+pub use stop_mask::StopMaskLane;
 mod ternary;
 mod tier_xfer;
 mod transfer;

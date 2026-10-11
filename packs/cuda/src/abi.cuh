@@ -4052,6 +4052,9 @@ struct KernelTableV1 {
     // 849: dl_order_votes (s, votes, q, stream) - reading-order votes, sigmoid(s - s^T) column
     // sums
     int (*dl_order_votes)(const void*, void*, uint32_t, void*);
+    // 850: stop_mask_rows (logits, par, flags, rows, n, stream) - the reasoning stop mask: active
+    // rows get stop pressure in flags and their stop logits set to -inf before sampling
+    int (*stop_mask_rows)(void*, const void*, void*, uint32_t, uint32_t, void*);
 };
 
 } // extern "C"
