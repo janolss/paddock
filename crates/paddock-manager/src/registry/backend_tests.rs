@@ -1,6 +1,79 @@
 use super::*;
 
 #[test]
+fn nemotron_mlx_catalog_is_native_directory_primary_without_cuda_or_mtp() {
+    let metal = Registry::new("./models".into()).with_backend("metal");
+    let model = metal.catalog_of("nemotron-3.5-lightning-30b").unwrap();
+    let artifact = model.artifact("mlx-8bit").unwrap();
+    assert_eq!(
+        model.default_weights_for_backend("metal", None).unwrap().id,
+        "mlx-8bit"
+    );
+    assert!(artifact.runtime.checkpoint_dir);
+    assert!(!artifact.runtime.supports_backend("cuda"));
+    assert_eq!(
+        artifact.runtime.capability.as_ref().unwrap(),
+        &["chat", "tools", "reasoning"]
+    );
+    assert_eq!(artifact.runtime.default_spec.as_deref(), Some("off"));
+    assert_eq!(artifact.runtime.kv_cache_dtype.as_deref(), Some("auto"));
+    assert_eq!(artifact.runtime.default_envelope(), (32768, 1));
+    assert!(!artifact.runtime.allows_companion("drafter"));
+    assert_eq!(artifact.files.len(), 14);
+    assert_eq!(
+        artifact
+            .files
+            .iter()
+            .filter(|f| f.dest.ends_with(".safetensors"))
+            .count(),
+        7
+    );
+    assert!(
+        artifact
+            .files
+            .iter()
+            .all(|f| f.url.contains("/881a85f9e84dac5ab1a61d4493739b5ef67efeaa/"))
+    );
+    let (path, tower, draft) = metal.planned_paths(&model.id, Some("mlx-8bit")).unwrap();
+    assert_eq!(
+        path,
+        std::path::Path::new("./models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-8bit")
+    );
+    assert!(tower.is_none() && draft.is_none());
+    let json = metal.catalog_annotated();
+    let row = json["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == model.id)
+        .unwrap();
+    let native = row["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "mlx-8bit")
+        .unwrap();
+    assert_eq!(native["backend_supported"], true);
+    assert_eq!(native["kv_offload_supported"], false);
+    let cuda = metal.with_backend("cuda");
+    let model = cuda.catalog_of("nemotron-3.5-lightning-30b").unwrap();
+    assert_eq!(
+        model
+            .default_weights_for_backend("cuda", Some([12, 0]))
+            .unwrap()
+            .id,
+        "nvfp4"
+    );
+    assert_eq!(
+        model
+            .default_weights_for_backend("cuda", Some([8, 6]))
+            .unwrap()
+            .id,
+        "q8"
+    );
+}
+
+#[test]
 fn lighton_metal_catalog_keeps_gguf_companions_separate_from_embedded_mlx() {
     for backend in ["metal", "cuda"] {
         let registry = Registry::new("./models".into()).with_backend(backend);
@@ -1255,7 +1328,7 @@ fn metal_nemotron_prices_only_native_trunk_and_actual_recurrent_blocks() {
         spec: None,
         offload: None,
     };
-    crate::estimate::metal_cache_shape(&mut shape, model, &env);
+    crate::estimate::metal_cache_shape(&mut shape, model, Some(a), &env);
     assert_eq!(shape.kv_reserve_sequences, 8);
     let r = shape.recurrent.unwrap();
     assert_eq!(
@@ -1472,7 +1545,12 @@ fn metal_projection_preserves_cuda_contracts_and_is_reversible() {
                 artifact.runtime.supports_backend("cuda"),
                 !matches!(
                     artifact.id.as_str(),
-                    "mlx-4bit" | "mlx-2bit" | "mlx8" | "splash-4bit" | "mlx-mixed-4-8bit"
+                    "mlx-4bit"
+                        | "mlx-2bit"
+                        | "mlx-8bit"
+                        | "mlx8"
+                        | "splash-4bit"
+                        | "mlx-mixed-4-8bit"
                 ),
                 "{}/{}",
                 model.id,

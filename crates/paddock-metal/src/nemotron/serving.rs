@@ -1,13 +1,18 @@
 use super::*;
 use paddock_engine::generator::{GenError, Generator};
 impl Generator for Nemotron {
+    fn reply_pin(&mut self, slot: usize) {
+        self.pin_reply(slot);
+    }
     fn anchor_at(&mut self, slot: usize, tokens: &[u32], upto: usize) {
         let Some(s) = self.slots.get(slot) else {
             return;
         };
         let upto = upto.min(s.history.len()).min(tokens.len());
         let limit = self.prefix_limit();
-        if let Some(at) = prefix::mark_anchor(&mut self.prefixes[..limit], tokens, upto) {
+        if let Some(at) =
+            prefix::mark_anchor_limited(&mut self.prefixes[..limit], tokens, upto, self.slots.len())
+        {
             tracing::debug!(at, "Metal Nemotron user-turn checkpoint anchored");
         }
     }
@@ -17,6 +22,8 @@ impl Generator for Nemotron {
             s.table.clear(&mut self.pool);
             s.history.clear();
             s.reused = 0;
+            s.prompt_end = 0;
+            s.tool_started = false;
         }
     }
     fn vocab(&self) -> usize {
@@ -38,7 +45,9 @@ impl Generator for Nemotron {
         Some(self.device.allocated_bytes())
     }
     fn forward(&mut self, token: u32) -> std::result::Result<Vec<f32>, GenError> {
-        Ok(self.execute(&[(0, token, self.slots[0].history.len() as u32)], &[0])?)
+        let out = self.execute(&[(0, token, self.slots[0].history.len() as u32)], &[0])?;
+        self.snapshot_reply(0)?;
+        Ok(out)
     }
     fn forward_prefill_stream(
         &mut self,
@@ -74,6 +83,7 @@ impl Generator for Nemotron {
             for (i, r) in rows.iter().enumerate() {
                 out[r.0 * VOCAB..(r.0 + 1) * VOCAB]
                     .copy_from_slice(&logits[i * VOCAB..(i + 1) * VOCAB]);
+                self.snapshot_reply(r.0)?;
             }
         }
         Ok(out)
@@ -84,6 +94,16 @@ impl Generator for Nemotron {
     fn pool_free_blocks(&self) -> Option<usize> {
         Some(self.pool.free_blocks())
     }
+    fn pool_admission_blocks(&self) -> Option<usize> {
+        // Cache-only pages are synchronously reclaimable; live/shared pages
+        // are not. Physical-free telemetry and pipeline headroom stay separate.
+        let active = self
+            .slots
+            .iter()
+            .flat_map(|s| s.table.blocks().iter().copied())
+            .collect::<std::collections::HashSet<_>>();
+        Some(self.pool.capacity() as usize - active.len())
+    }
     fn release_inactive_slots(&mut self, occupied: &[bool]) {
         for i in 0..self.slots.len() {
             if !occupied.get(i).copied().unwrap_or(false)
@@ -93,6 +113,8 @@ impl Generator for Nemotron {
                 self.slots[i].table.clear(&mut self.pool);
                 self.slots[i].history.clear();
                 self.slots[i].reused = 0;
+                self.slots[i].prompt_end = 0;
+                self.slots[i].tool_started = false;
             }
         }
     }
@@ -108,7 +130,7 @@ impl Generator for Nemotron {
     }
     // the mixed grant: row_cap less the decode rows sharing it
     fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
-        crate::schedule::row_cap(decode_rows, CHUNK).saturating_sub(decode_rows)
+        self.mixed_row_cap(decode_rows).saturating_sub(decode_rows)
     }
     fn prefill_begin(
         &mut self,
@@ -133,6 +155,8 @@ impl Generator for Nemotron {
             s.table.clear(&mut self.pool);
             s.history.clear();
             s.reused = 0;
+            s.prompt_end = 0;
+            s.tool_started = false;
         }
         true
     }
@@ -152,12 +176,17 @@ impl Generator for Nemotron {
         }
         let mut rows = decodes.to_vec();
         let mut complete = Vec::new();
-        let cap = crate::schedule::row_cap(decodes.len(), CHUNK);
-        let advances = crate::schedule::grants(
+        let cap = self.mixed_row_cap(decodes.len());
+        let advances = crate::schedule::capped_grants(
             &self
                 .pending
                 .iter()
                 .map(|p| (p.tokens.len() - p.offset, p.work))
+                .collect::<Vec<_>>(),
+            &self
+                .pending
+                .iter()
+                .map(|p| self.pending_span(p.offset, p.tokens.len()))
                 .collect::<Vec<_>>(),
             budget.min(cap.saturating_sub(rows.len())),
             decodes.is_empty(),
@@ -177,6 +206,9 @@ impl Generator for Nemotron {
             .chain(complete.iter().map(|r| r.1))
             .collect::<Vec<_>>();
         let logits = self.execute(&rows, &outputs)?;
+        for &(slot, _, _) in decodes {
+            self.snapshot_reply(slot)?;
+        }
         for slot in self
             .pending
             .iter()

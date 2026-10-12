@@ -93,6 +93,7 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     include_str!("../../../packs/metal/laguna.metal"),
     include_str!("../../../packs/metal/kolibri.metal"),
     include_str!("../../../packs/metal/nemotron.metal"),
+    include_str!("../../../packs/metal/nemotron_mlx.metal"),
     include_str!("../../../packs/metal/paddleocr.metal"),
     include_str!("../../../packs/metal/unlimited_ocr.metal"),
     include_str!("../../../packs/metal/unlimited_vision.metal"),
@@ -649,6 +650,96 @@ impl MetalDevice {
             "pocr_extract",
             "pocr_attention",
             "nemo_state_copy",
+            "nemo_mlx_a",
+            "nemo_mlx_project_exact",
+            "nemo_mlx_project_exact_wide",
+            "nemo_mlx_project",
+            "nemo_mlx_project_wide",
+            "nemo_mlx_project_reuse",
+            #[cfg(test)]
+            "nemo_mlx_project_reuse_baseline",
+            "nemo_mlx_project_reuse128",
+            "nemo_mlx_vector1_reuse",
+            "nemo_mlx_vector4_reuse",
+            "nemo_mlx_up_decode_reuse",
+            "nemo_mlx_down_decode_reuse",
+            "nemo_mlx_router4",
+            #[cfg(test)]
+            "nemo_mlx_route_order",
+            #[cfg(test)]
+            "nemo_mlx_up_decode_sorted",
+            #[cfg(test)]
+            "nemo_mlx_down_decode_sorted",
+            #[cfg(test)]
+            "nemo_mlx_up_decode_cols2",
+            #[cfg(test)]
+            "nemo_mlx_down_decode_cols2",
+            #[cfg(test)]
+            "nemo_mlx_up_decode_cols8",
+            #[cfg(test)]
+            "nemo_mlx_down_decode_cols8",
+            #[cfg(test)]
+            "nemo_mlx_up_decode_cols16",
+            #[cfg(test)]
+            "nemo_mlx_down_decode_cols16",
+            "nemo_mlx_up_vector_group4",
+            "nemo_mlx_down_vector_group4",
+            "nemo_mlx_up_vector_group8",
+            "nemo_mlx_down_vector_group8",
+            #[cfg(test)]
+            "nemo_mlx_project_cooperative",
+            "nemo_mlx_project_exact_mixed",
+            "nemo_mlx_project_exact_large",
+            "nemo_mlx_vector1",
+            "nemo_mlx_vector4",
+            "nemo_mlx_scan",
+            "nemo_mlx_ssd_states",
+            "nemo_mlx_embed",
+            "nemo_mlx_conv",
+            "nemo_mlx_ssd_prepare",
+            "nemo_mlx_ssd_matrix",
+            "nemo_mlx_ssd_output",
+            "nemo_mlx_gated_norm",
+            "nemo_mlx_store",
+            "nemo_mlx_attention_decode",
+            "nemo_mlx_prefill_tensor",
+            "nemo_mlx_up_decode",
+            "nemo_mlx_down_decode",
+            "nemo_mlx_up_grouped",
+            "nemo_mlx_down_grouped",
+            "nemo_mlx_up_grouped32",
+            "nemo_mlx_down_grouped32",
+            #[cfg(test)]
+            "nemo_mlx_up_cooperative",
+            #[cfg(test)]
+            "nemo_mlx_down_cooperative",
+            "nemo_mlx_up_bf16",
+            "nemo_mlx_down_bf16",
+            "nemo_mlx_expert_offsets",
+            "nemo_mlx_expert_pack",
+            "nemo_mlx_up_reuse",
+            "nemo_mlx_down_reuse",
+            "nemo_mlx_up_reuse64",
+            "nemo_mlx_down_reuse64",
+            #[cfg(test)]
+            "nemo_mlx_up_reuse128",
+            #[cfg(test)]
+            "nemo_mlx_down_reuse128",
+            "nemo_mlx_up_reuse64_k128",
+            "nemo_mlx_down_reuse64_k128",
+            "nemo_mlx_ssd_matrix_reference",
+            "nemo_mlx_ssd_output_reference",
+            "nemo_mlx_ssd_delta_reference",
+            "nemo_mlx_splitk_reference",
+            "nemo_mlx_project_split",
+            "nemo_mlx_project_split_sum",
+            #[cfg(test)]
+            "nemo_mlx_up_f32_reference",
+            #[cfg(test)]
+            "nemo_mlx_down_f32_reference",
+            "nemo_mlx_relu2",
+            "nemo_mlx_fold",
+            "nemo_mlx_rms_selected",
             "nemo_conv",
             "nemo_conv_commit",
             "nemo_scan",
@@ -1691,14 +1782,15 @@ impl MetalDevice {
         }
         let profile = paddock_models::dev_var_os!("PADDOCK_METAL_PROFILE").is_some();
         if raw.supportsFamily(MTLGPUFamily::Apple10) {
-            let name = "mlx_attention_prefill_nax";
-            let fun = lib
-                .newFunctionWithName(&NSString::from_str(name))
-                .ok_or_else(|| MetalError::Device(format!("missing kernel {name}")))?;
-            let pipeline = raw
-                .newComputePipelineStateWithFunction_error(&fun)
-                .map_err(|e| MetalError::Device(format!("{name}: {e}")))?;
-            kernels.insert(name, pipeline);
+            for name in ["mlx_attention_prefill_nax", "nemo_mlx_prefill_nax"] {
+                let fun = lib
+                    .newFunctionWithName(&NSString::from_str(name))
+                    .ok_or_else(|| MetalError::Device(format!("missing kernel {name}")))?;
+                let pipeline = raw
+                    .newComputePipelineStateWithFunction_error(&fun)
+                    .map_err(|e| MetalError::Device(format!("{name}: {e}")))?;
+                kernels.insert(name, pipeline);
+            }
         }
         let residency = if required.is_some() {
             Some(Arc::new(ResidentSet::new(&raw, &queue)?))
@@ -2114,6 +2206,10 @@ impl Commands<'_> {
                 || name == "gmlx_vmm64"
                 || name.starts_with("dg_project")
                 || name.starts_with("dg_experts")
+                || name.starts_with("nemo_mlx_project")
+                || name.starts_with("nemo_mlx_vector")
+                || name.starts_with("nemo_mlx_up_")
+                || name.starts_with("nemo_mlx_down_")
                 || name.starts_with("q4a_mv")
                 || name.starts_with("q4a_mm")
                 || name.starts_with("splash_affine")
@@ -2492,6 +2588,7 @@ mod tests {
             "qmlx_vis_attention_candidate_16",
             "qmlx_vis_attention_candidate_bounded_12",
             "qmlx_vis_attention_candidate_bounded_16",
+            "nemo_mlx_prefill_tensor",
         ] {
             let function = lib.newFunctionWithName(&NSString::from_str(name)).unwrap();
             raw.newComputePipelineStateWithFunction_error(&function)
@@ -2499,6 +2596,10 @@ mod tests {
         }
         assert!(
             lib.newFunctionWithName(&NSString::from_str("mlx_attention_prefill_nax"))
+                .is_none()
+        );
+        assert!(
+            lib.newFunctionWithName(&NSString::from_str("nemo_mlx_prefill_nax"))
                 .is_none()
         );
     }

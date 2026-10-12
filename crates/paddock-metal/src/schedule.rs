@@ -43,6 +43,39 @@ pub(crate) fn grants(work: &[(usize, usize)], budget: usize, cold: bool) -> Vec<
     balanced_grants(&work.iter().map(|w| w.0).collect::<Vec<_>>(), budget)
 }
 
+/// Checkpoint boundaries cap a grant, not a request's fair-share weight. Spend
+/// leftovers on eligible peers without treating a nearby checkpoint as a short
+/// prompt. Each redistribution either spends the budget or saturates a cap.
+pub(crate) fn capped_grants(
+    work: &[(usize, usize)],
+    caps: &[usize],
+    budget: usize,
+    cold: bool,
+) -> Vec<usize> {
+    assert_eq!(work.len(), caps.len());
+    let mut result = vec![0; work.len()];
+    let mut left = budget;
+    while left > 0 {
+        let active: Vec<_> = (0..work.len())
+            .filter(|&i| result[i] < caps[i].min(work[i].0))
+            .collect();
+        if active.is_empty() {
+            break;
+        }
+        let remaining: Vec<_> = active
+            .iter()
+            .map(|&i| (work[i].0 - result[i], work[i].1))
+            .collect();
+        let proposed = grants(&remaining, left, cold);
+        for (i, share) in active.into_iter().zip(proposed) {
+            let n = share.min(caps[i] - result[i]);
+            result[i] += n;
+            left -= n;
+        }
+    }
+    result
+}
+
 /// Work-conserving fair grants for already-admitted short resume tails. FIFO
 /// completes one early, turning another prefill lane into a decode and leaving
 /// fewer rows for its peers. Balancing keeps all tiny tails making progress.
@@ -85,6 +118,44 @@ pub(crate) fn tiled_grants(work: &[usize], budget: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkpoints_bound_work_without_distorting_fair_weights() {
+        let work = [(7680, 8192), (8192, 8192), (8192, 8192), (8192, 8192)];
+        assert_eq!(
+            capped_grants(&work, &[7168, 512, 512, 512], 2048, true),
+            [512; 4]
+        );
+        assert_eq!(
+            capped_grants(&work, &[7168, 512, 512, 512], 128, false),
+            [128, 0, 0, 0]
+        );
+        for cold in [false, true] {
+            for a in 0..9 {
+                for b in 0..9 {
+                    let work = [(a, 512), (b, 512), (7, 512)];
+                    for cap in 0..10 {
+                        let caps = [cap, 3, 5];
+                        for budget in 0..30 {
+                            let got = capped_grants(&work, &caps, budget, cold);
+                            let available: usize =
+                                work.iter().zip(caps).map(|(w, c)| w.0.min(c)).sum();
+                            assert_eq!(got.iter().sum::<usize>(), budget.min(available));
+                            assert!(
+                                got.iter()
+                                    .zip(work.iter().zip(caps))
+                                    .all(|(g, (w, c))| *g <= w.0.min(c))
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        capped_grants(&work, &[a, b, 7], 8, cold),
+                        grants(&work, 8, cold)
+                    );
+                }
+            }
+        }
+        assert!(capped_grants(&[], &[], 2048, true).is_empty());
+    }
     #[test]
     fn tiled_diagnostic_grants_conserve_bounded_work() {
         for work in [

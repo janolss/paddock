@@ -69,11 +69,11 @@ kernel void nemo_ssd_prepare(device const float* proj [[buffer(0)]],device const
 // C B^T (32x128x32), then the causal semiseparable decay mask. BK32
 // panels are bounded independently of context and remain under Apple10's
 // compiled threadgroup limit with API and shader instrumentation.
-kernel void nemo_ssd_matrix(device const float* conv [[buffer(0)]],device const uint* tiles [[buffer(1)]],
- device const float* decay [[buffer(2)]],device const float* dt [[buffer(3)]],device float* matrix [[buffer(4)]],
- uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+template<bool Mlx>
+inline void nemo_ssd_matrix_impl(device const float* conv,device const uint* tiles,
+ device const float* decay,device const float* dt,device float* matrix,
+ uint2 g,uint tid,threadgroup float* ca,threadgroup float* ba) {
     uint h=g.x,first=tiles[4*g.y+1],count=tiles[4*g.y+2],group=h/8;
-    threadgroup float ca[32*32],ba[32*32];
     auto c=tensor(ca,extents<int,32,32>(),array<int,2>{1,32});
     auto b=tensor(ba,extents<int,32,32>(),array<int,2>{1,32});
     constexpr auto desc=matmul2d_descriptor(32,32,32,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
@@ -89,8 +89,14 @@ kernel void nemo_ssd_matrix(device const float* conv [[buffer(0)]],device const 
     ulong off=(ulong(g.y)*64+h)*32;
     for(auto it=acc.begin();it!=acc.end();++it){auto ij=it.get_multidimensional_index();
         if(it.is_valid_element()){uint t=ij[1],s=ij[0];
-            matrix[off*32+t*32+s]=t<count && s<=t ? *it*exp(decay[off+t]-decay[off+s])*dt[ulong(first+s)*64+h] : 0;}}
+            matrix[off*32+t*32+s]=t<count && s<=t ? (Mlx?mlx_bf(*it):*it)*exp(decay[off+t]-decay[off+s])*dt[ulong(first+s)*64+h] : 0;}}
 }
+kernel void nemo_ssd_matrix(device const float* conv [[buffer(0)]],device const uint* tiles [[buffer(1)]],
+ device const float* decay [[buffer(2)]],device const float* dt [[buffer(3)]],device float* matrix [[buffer(4)]],
+ uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {threadgroup float ca[32*32],ba[32*32];nemo_ssd_matrix_impl<false>(conv,tiles,decay,dt,matrix,g,tid,ca,ba);}
+kernel void nemo_mlx_ssd_matrix(device const float* conv [[buffer(0)]],device const uint* tiles [[buffer(1)]],
+ device const float* decay [[buffer(2)]],device const float* dt [[buffer(3)]],device float* matrix [[buffer(4)]],
+ uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {threadgroup float ca[32*32],ba[32*32];nemo_ssd_matrix_impl<true>(conv,tiles,decay,dt,matrix,g,tid,ca,ba);}
 // A tile's final state increment B^T (dt*X*decay). Results use the same
 // [head,value,state] layout as decode; no state-sized threadgroup buffer.
 kernel void nemo_ssd_delta(device const float* conv [[buffer(0)]],device const uint* tiles [[buffer(1)]],
@@ -124,12 +130,12 @@ kernel void nemo_ssd_states(device float* state [[buffer(0)]],device const float
 }
 // Incoming-state and within-tile output contractions are fused in registers.
 // Each TG owns 32 tokens x 16 value columns, staging only BK32 panels.
-kernel void nemo_ssd_output(device const float* conv [[buffer(0)]],device const uint* tiles [[buffer(1)]],
- device const float* decay [[buffer(2)]],device const float* matrix [[buffer(3)]],device const float* incoming [[buffer(4)]],
- device const float* d [[buffer(5)]],device float* out [[buffer(6)]],uint3 g [[threadgroup_position_in_grid]],
- uint tid [[thread_index_in_threadgroup]]) {
+template<bool Mlx>
+inline void nemo_ssd_output_impl(device const float* conv,device const uint* tiles,
+ device const float* decay,device const float* matrix,device const float* incoming,
+ device const float* d,device float* out,uint3 g,
+ uint tid,threadgroup float* aa,threadgroup float* bb) {
     uint first=tiles[4*g.z+1],count=tiles[4*g.z+2],h=g.y,col=g.x*16;ulong off=(ulong(g.z)*64+h)*32;
-    threadgroup float aa[32*32],bb[16*32];
     auto a=tensor(aa,extents<int,32,32>(),array<int,2>{1,32});
     auto b=tensor(bb,extents<int,32,16>(),array<int,2>{1,32});
     constexpr auto desc=matmul2d_descriptor(32,16,32,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
@@ -147,8 +153,16 @@ kernel void nemo_ssd_output(device const float* conv [[buffer(0)]],device const 
     threadgroup_barrier(mem_flags::mem_threadgroup);op.run(a,b,acc);
     for(auto it=acc.begin();it!=acc.end();++it){auto ij=it.get_multidimensional_index();if(it.is_valid_element() && ij[1]<count){
         ulong at=ulong(first+ij[1])*4096+h*64+col+ij[0];
-        out[at]=*it+d[h]*conv[ulong(first+ij[1])*6144+h*64+col+ij[0]];}}
+        out[at]=Mlx ? mlx_bf(mlx_bf(*it)+mlx_bf(d[h]*conv[ulong(first+ij[1])*6144+h*64+col+ij[0]])) : *it+d[h]*conv[ulong(first+ij[1])*6144+h*64+col+ij[0]];}}
 }
+kernel void nemo_ssd_output(device const float* conv [[buffer(0)]],device const uint* tiles [[buffer(1)]],
+ device const float* decay [[buffer(2)]],device const float* matrix [[buffer(3)]],device const float* incoming [[buffer(4)]],
+ device const float* d [[buffer(5)]],device float* out [[buffer(6)]],uint3 g [[threadgroup_position_in_grid]],
+ uint tid [[thread_index_in_threadgroup]]) {threadgroup float aa[32*32],bb[16*32];nemo_ssd_output_impl<false>(conv,tiles,decay,matrix,incoming,d,out,g,tid,aa,bb);}
+kernel void nemo_mlx_ssd_output(device const float* conv [[buffer(0)]],device const uint* tiles [[buffer(1)]],
+ device const float* decay [[buffer(2)]],device const float* matrix [[buffer(3)]],device const float* incoming [[buffer(4)]],
+ device const float* d [[buffer(5)]],device float* out [[buffer(6)]],uint3 g [[threadgroup_position_in_grid]],
+ uint tid [[thread_index_in_threadgroup]]) {threadgroup float aa[32*32],bb[16*32];nemo_ssd_output_impl<true>(conv,tiles,decay,matrix,incoming,d,out,g,tid,aa,bb);}
 kernel void nemo_gated_norm(device const float* y [[buffer(0)]],device const float* proj [[buffer(1)]],
  device const float* w [[buffer(2)]],device float* out [[buffer(3)]],constant uint* p [[buffer(4)]],
  uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
@@ -192,7 +206,7 @@ inline void nemo_expert_decode(device const uchar* w,device const float* x,devic
             *reinterpret_cast<device const float4*>(x+ulong(Down?entry:entry/6)*p[0]+k+j),acc);}
     float v=simd_sum(acc.x+acc.y+acc.z+acc.w);if(!Down)v=max(v,0.0f)*max(v,0.0f);if(lane==0)out[ulong(entry)*p[1]+n]=v;
 }
-template<bool Down>
+template<bool Down,uint Ty=8>
 inline void nemo_expert_grouped(device const uchar* w,device const float* x,device const uint* lists,device const uint* counts,
  device const uint* tiles,device float* out,constant uint* p,uint2 g,uint tid,threadgroup float* aa,threadgroup float* bb){
     if(g.y>=tiles[0])return;uint e=tiles[1+2*g.y],first=tiles[2+2*g.y],count=min(16u,counts[e]-first),nbase=g.x*32;
@@ -203,10 +217,13 @@ inline void nemo_expert_grouped(device const uchar* w,device const float* x,devi
     for(uint base=0;base<p[0];base+=64){
         for(uint i=tid;i<1024;i+=128){uint r=i/64,k=base+i%64,entry=r<count?lists[e*p[2]*6+first+r]:0;
             aa[i]=r<count && k<p[0]?x[ulong(Down?entry:entry/6)*p[0]+k]:0;}
-        for(uint i=tid;i<2048;i+=128){uint n=nbase+i/64,k=base+i%64;bb[i]=n<p[1] && k<p[0]?qmoe_q8(w,(ulong(e)*p[1]+n)*p[0]+k):0;}
+        for(uint i=tid;i<2048;i+=128){uint n=nbase+i/64,k=base+i%64;ulong at=(ulong(e)*p[1]+n)*p[0]+k;
+            if constexpr(Ty==0x108) bb[i]=n<p[1] && k<p[0]?mlx_bf(dg_weight(w,p[0],p[1]*128,Ty,at)):0;
+            else bb[i]=n<p[1] && k<p[0]?qmoe_q8(w,at):0;}
         threadgroup_barrier(mem_flags::mem_threadgroup);op.run(a,b,acc);threadgroup_barrier(mem_flags::mem_threadgroup);}
     for(auto it=acc.begin();it!=acc.end();++it){auto ij=it.get_multidimensional_index();if(it.is_valid_element() && ij[1]<count && nbase+ij[0]<p[1]){
-        uint entry=lists[e*p[2]*6+first+ij[1]];float v=*it;if(!Down)v=max(v,0.0f)*max(v,0.0f);out[ulong(entry)*p[1]+nbase+ij[0]]=v;}}
+        uint entry=lists[e*p[2]*6+first+ij[1]];float v=*it;if constexpr(Ty==0x108)v=mlx_bf(v);
+        if(!Down)v=max(v,0.0f)*max(v,0.0f);if constexpr(Ty==0x108)v=mlx_bf(v);out[ulong(entry)*p[1]+nbase+ij[0]]=v;}}
 }
 #define NEMO_EXPERT(NAME,DOWN) \
 kernel void NAME##_decode(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]],device const uint* ids [[buffer(2)]],device float* out [[buffer(3)]],constant uint* p [[buffer(4)]],uint2 g [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){nemo_expert_decode<DOWN>(w,x,ids,out,p,g,sg,lane);} \

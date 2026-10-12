@@ -7,6 +7,128 @@ fn run_decode(model: &mut Nemotron) -> Vec<Vec<f32>> {
 }
 
 #[test]
+#[ignore = "requires PADDOCK_NEMOTRON_MLX_MODEL; exact reply-boundary restore and bounded eviction"]
+fn mlx_tool_boundary_restore_preserves_live_logits_and_reclaims_pages() {
+    let path = std::env::var("PADDOCK_NEMOTRON_MLX_MODEL").unwrap();
+    let tokenizer = paddock_tokenizer::GgufTokenizer::from_hf_dir(Path::new(&path)).unwrap();
+    let newline = tokenizer.encode(":\n").unwrap();
+    assert_eq!(
+        newline.len(),
+        1,
+        "exercise a punctuation/newline merged token"
+    );
+    for batch in [1, 4] {
+        let mut model = Nemotron::load(Path::new(&path), 2048, batch, None).unwrap();
+        let allocated = model.device.allocated_bytes();
+        assert_eq!(model.prefixes.len(), batch * MLX_PREFIX_PER_SLOT);
+        let prompts: Vec<Vec<u32>> = (0..batch)
+            .map(|s| (1000 + s as u32 * 1000..1513 + s as u32 * 1000).collect())
+            .collect();
+        let mut expected = Vec::new();
+        for pass in 0..2 {
+            model.reset();
+            while model.evict_prefix() {}
+            for (s, p) in prompts.iter().enumerate() {
+                model.prefill(s, p).unwrap();
+                model.anchor_at(s, p, 512);
+                // An immediate tool call has no reply checkpoint to pin and
+                // must not sacrifice the prompt-end state.
+                if pass == 0 {
+                    model.reply_pin(s);
+                }
+            }
+            for step in 0..31 {
+                model
+                    .forward_batch(&vec![9000 + step; batch], &vec![513 + step; batch])
+                    .unwrap();
+                if step == 14 {
+                    assert!(
+                        model.prefixes.iter().all(|c| !c.reply_candidate),
+                        "a partial first page must not occupy the narration checkpoint"
+                    );
+                }
+            }
+            if pass == 0 {
+                for s in 0..batch {
+                    expected.push(
+                        model
+                            .execute(&[(s, 9500, 544), (s, 9501, 545)], &[1])
+                            .unwrap(),
+                    );
+                }
+                continue;
+            }
+            // The last token of a later page is ":\n". On a new user turn
+            // the template changes it to ":\n\n"; keep the preceding complete
+            // state rather than replacing it with this unstable boundary.
+            for step in 31..47 {
+                let token = if step == 46 { newline[0] } else { 9000 + step };
+                model
+                    .forward_batch(&vec![token; batch], &vec![513 + step; batch])
+                    .unwrap();
+            }
+            assert!(
+                model
+                    .prefixes
+                    .iter()
+                    .filter(|c| c.reply_candidate)
+                    .all(|c| c.history.len() == 544)
+            );
+            for s in 0..batch {
+                model.reply_pin(s);
+            }
+            assert_eq!(model.prefixes.iter().filter(|c| c.reply).count(), batch);
+            for step in 47..64 {
+                model
+                    .forward_batch(&vec![9000 + step; batch], &vec![513 + step; batch])
+                    .unwrap();
+            }
+            model.release_inactive_slots(&[]);
+            for (s, p) in prompts.iter().enumerate() {
+                let mut tool = p.clone();
+                tool.extend(9000..9046);
+                tool.push(newline[0]);
+                tool.extend(9047..9064);
+                tool.extend(9800..9871);
+                model.prefill(s, &tool).unwrap();
+            }
+            model.release_inactive_slots(&[]);
+            // The client normalizes the earlier tool call on a new user turn.
+            // The protected pre-call state remains reachable through later
+            // tool-result prefills even though their full keys no longer match.
+            for (s, p) in prompts.iter().enumerate() {
+                let mut branch = p.clone();
+                branch.extend(9000..9031);
+                branch.extend([9500, 9501]);
+                let reuse = model.prepare(s, &branch).unwrap();
+                assert_eq!(reuse, 544, "slot {s}");
+                let restored = model
+                    .execute(&[(s, 9500, 544), (s, 9501, 545)], &[1])
+                    .unwrap();
+                assert!(restored == expected[s], "all vocabulary logits, slot {s}");
+                assert_eq!(model.device.allocated_bytes(), allocated);
+                let mut pending = branch;
+                pending.extend(10000..10513);
+                model.prefill_begin(s, pending).unwrap();
+                model.forward_mixed(&[], 17).unwrap();
+                assert!(model.prefill_abort(s));
+            }
+        }
+        model.release_inactive_slots(&[]);
+        assert_eq!(
+            model.pool_admission_blocks(),
+            Some(model.pool.capacity() as usize)
+        );
+        while model.evict_prefix() {}
+        assert_eq!(
+            model.pool_free_blocks(),
+            Some(model.pool.capacity() as usize)
+        );
+        assert_eq!(model.device.allocated_bytes(), allocated);
+    }
+}
+
+#[test]
 #[ignore = "requires PADDOCK_NEMOTRON_TEST_MODEL; exact full-model retained-state checks"]
 fn user_turn_and_interleaved_prefixes_preserve_all_logits() {
     let path = std::env::var("PADDOCK_NEMOTRON_TEST_MODEL").unwrap();
@@ -108,7 +230,7 @@ fn user_turn_and_interleaved_prefixes_preserve_all_logits() {
         while model.evict_prefix() {}
         assert_eq!(
             model.pool.free_blocks(),
-            model.page_stride * slots * (1 + PREFIX_PER_SLOT)
+            model.page_stride * (slots + model.prefixes.len())
         );
         assert_eq!(model.device.allocated_bytes(), allocated);
     }

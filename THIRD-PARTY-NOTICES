@@ -4205,6 +4205,10 @@ causal loads. Its election is limited to the native 0.8B tied-head MLX vision
 backbone on Apple10; 4B remains diagnostic-only. No reference replay is
 available at runtime.
 
+`nemotron_mlx.metal` reuses the same attributed register-fragment primitives
+for head-128 paged causal attention on Apple10. Each SIMD owns 16 queries;
+unlike head-256 attention it needs no cross-SIMD head-dimension exchange.
+
 The companion `qwen_mlx_vision.metal` also preserves the normalization and
 convolution arithmetic contracts of MLX v0.32.3. Reference sources:
 

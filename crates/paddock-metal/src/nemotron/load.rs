@@ -12,6 +12,9 @@ impl Nemotron {
         max_batch: usize,
         budget: Option<u64>,
     ) -> Result<Self> {
+        if path.is_dir() {
+            return Self::load_mlx(path, context, max_batch, budget);
+        }
         let map = MappedGguf::open(path).map_err(|e| MetalError::Model(e.to_string()))?;
         let hp =
             NemotronConfig::from_gguf(map.gguf()).map_err(|e| MetalError::Model(e.to_string()))?;
@@ -240,6 +243,7 @@ impl Nemotron {
                 .map(|_| prefix::Checkpoint::default())
                 .collect(),
             prefix_clock: 0,
+            reply_trim_tokens: vec![],
             pool: KvPool::with_blocks(blocks as u32),
             context,
             page_stride,
@@ -250,53 +254,74 @@ impl Nemotron {
             scan_only: false,
             #[cfg(test)]
             single_snapshot: false,
+            #[cfg(test)]
+            reference_inputs: vec![],
         })
     }
 }
 impl Scratch {
     pub(super) fn sizes(batch: usize, pages: usize) -> [usize; 35] {
-        let tiles = CHUNK.div_ceil(32) + batch;
+        Self::sizes_for_rows(batch, pages, CHUNK, false)
+    }
+    pub(super) fn sizes_for_rows(
+        batch: usize,
+        pages: usize,
+        chunk: usize,
+        mlx: bool,
+    ) -> [usize; 35] {
+        let tiles = chunk.div_ceil(32) + batch;
         [
-            CHUNK,
-            CHUNK * 2,
+            chunk,
+            chunk * 2,
             batch * pages,
-            CHUNK,
-            CHUNK,
-            CHUNK * 2,
+            chunk,
+            chunk,
+            chunk * 2,
             batch * 4,
             tiles * 4,
-            CHUNK * WIDTH,
-            CHUNK * WIDTH,
-            CHUNK * WIDTH,
-            CHUNK * PROJECTED,
-            CHUNK * CONV,
-            CHUNK * INNER,
-            CHUNK * INNER,
-            CHUNK * 64,
+            chunk * WIDTH,
+            chunk * WIDTH,
+            chunk * WIDTH,
+            chunk * PROJECTED,
+            chunk * CONV,
+            chunk * INNER,
+            chunk * INNER,
+            chunk * 64,
             tiles * 64 * 32,
             tiles * 64 * 32 * 32,
             tiles * STATE,
             tiles * STATE,
-            CHUNK * 4096,
-            CHUNK * 256,
-            CHUNK * 256,
-            CHUNK * 4096,
-            CHUNK * 32 * SPLITS * 130,
-            CHUNK * 128,
-            CHUNK * 6,
-            CHUNK * 6,
-            128 * CHUNK * 6,
+            chunk * 4096,
+            chunk * 256,
+            chunk * 256,
+            chunk * 4096,
+            // MLX uses the split decoder only for warm singleton sequences.
+            // Prefill rows never address this plane; bound it by live slots.
+            (if mlx { batch } else { chunk }) * 32 * SPLITS * 130,
+            chunk * 128,
+            chunk * 6,
+            chunk * 6,
+            128 * chunk * 6,
             128,
-            1 + 2 * ((CHUNK * 6).div_ceil(16) + 128),
-            CHUNK * 6 * FF,
-            CHUNK * 6 * WIDTH,
-            CHUNK * SHARED,
+            1 + 2 * ((chunk * 6).div_ceil(16) + 128),
+            chunk * 6 * FF,
+            chunk * 6 * WIDTH,
+            chunk * SHARED,
             batch * VOCAB,
         ]
         .map(|n| n * 4)
     }
-    fn new(d: &MetalDevice, batch: usize, pages: usize) -> Result<Self> {
-        let mut sizes = Self::sizes(batch, pages).into_iter();
+    pub(super) fn new(d: &MetalDevice, batch: usize, pages: usize) -> Result<Self> {
+        Self::new_for_rows(d, batch, pages, CHUNK, false)
+    }
+    pub(super) fn new_for_rows(
+        d: &MetalDevice,
+        batch: usize,
+        pages: usize,
+        chunk: usize,
+        mlx: bool,
+    ) -> Result<Self> {
+        let mut sizes = Self::sizes_for_rows(batch, pages, chunk, mlx).into_iter();
         let mut a = || d.alloc(sizes.next().expect("scratch layout"));
         let result = Self {
             ids: a()?,

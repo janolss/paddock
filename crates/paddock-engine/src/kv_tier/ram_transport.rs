@@ -336,6 +336,9 @@ impl RamTransport {
             }
             tracing::info!(mode = ?store.mode(), "KV tier self-test passed (device -> slab -> verify)");
         }
+        // the first slab is proven: the rest of the budget builds off the
+        // engine thread from here (see host.rs `SlabSupply`)
+        store.start_supply(Some(exec.stream.context().clone()));
         tracing::info!(
             capacity_gib = ram_capacity as f64 / (1u64 << 30) as f64,
             staging_mib = device_staging_bytes() >> 20,
@@ -415,6 +418,14 @@ impl RamTransport {
 
     pub fn host_mode(&self) -> PinMode {
         self.store.mode()
+    }
+
+    /// Whether the whole T1 budget is carved yet (the slab supply has
+    /// delivered its last slab), and `(slabs, pinned slabs)` so far.
+    pub fn t1_slabs(&mut self) -> (bool, usize, usize) {
+        let done = self.store.supply_done();
+        let (n, pinned) = self.store.slab_counts();
+        (done, n, pinned)
     }
 
     /// The footprint the T1 arena charges for `bytes`.

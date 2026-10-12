@@ -150,10 +150,20 @@ fn messages_from_input(instructions: Option<&str>, input: &Value) -> Result<Vec<
     if let Some(instr) = instructions {
         msgs.push(json!({"role": "system", "content": instr}));
     }
-    // A `reasoning` item describes the assistant message that FOLLOWS it (that
-    // is the order this server emits them in, and OpenAI's), so it is held here
-    // until that message arrives rather than becoming a turn of its own.
+    // A `reasoning` item describes the assistant turn that FOLLOWS it (that is
+    // the order this server emits them in, and OpenAI's), so it is held here
+    // until that turn arrives rather than becoming a turn of its own. The turn
+    // is whatever one response output: [reasoning] [message] [function_call..]
+    // - so the message and every call right after it fold into ONE assistant
+    // message carrying the reasoning, the shape the model generated. Split
+    // into one assistant message per call (or with the reasoning dropped),
+    // the history renders tokens the model never wrote: it loses its own
+    // chain of thought between tool steps, and every agent step re-prefills
+    // the previous reply instead of resuming from it.
     let mut pending_reasoning: Option<String> = None;
+    // the last message is an assistant turn still taking this response's
+    // calls (nothing but its own items came after it)
+    let mut turn_open = false;
     match input {
         Value::String(s) => msgs.push(json!({"role": "user", "content": s})),
         Value::Array(items) => {
@@ -177,9 +187,10 @@ fn messages_from_input(instructions: Option<&str>, input: &Value) -> Result<Vec<
                         } else {
                             full
                         };
-                        if !text.is_empty() {
-                            pending_reasoning = Some(text);
-                        }
+                        // a reasoning item opens the next turn; an empty one
+                        // attaches nothing (and drops no stale text onto it)
+                        pending_reasoning = (!text.is_empty()).then_some(text);
+                        turn_open = false;
                     }
                     "message" => {
                         let role = it.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -204,12 +215,18 @@ fn messages_from_input(instructions: Option<&str>, input: &Value) -> Result<Vec<
                         // (`message.reasoning_content`), which is also the
                         // chat-completions spelling - one shape reaches the
                         // template whichever API the caller used.
-                        if role == "assistant"
-                            && let Some(r) = pending_reasoning.take()
-                            && let Some(o) = m.as_object_mut()
-                        {
-                            o.insert("reasoning_content".into(), json!(r));
+                        if role == "assistant" {
+                            if let Some(r) = pending_reasoning.take()
+                                && let Some(o) = m.as_object_mut()
+                            {
+                                o.insert("reasoning_content".into(), json!(r));
+                            }
+                        } else {
+                            // a reasoning item no assistant output followed
+                            // never rides some later turn
+                            pending_reasoning = None;
                         }
+                        turn_open = role == "assistant";
                         msgs.push(m);
                     }
                     // prior tool result fed back for the next turn
@@ -217,17 +234,34 @@ fn messages_from_input(instructions: Option<&str>, input: &Value) -> Result<Vec<
                         let out = crate::tool_images::output_content(it.get("output"));
                         let id = it.get("call_id").and_then(Value::as_str).unwrap_or("");
                         msgs.push(json!({"role": "tool", "content": out, "tool_call_id": id}));
+                        pending_reasoning = None;
+                        turn_open = false;
                     }
-                    // prior assistant tool call, for conversation context
+                    // prior assistant tool call, for conversation context: it
+                    // joins its response's assistant turn (parallel calls are
+                    // ONE message with several tool_calls) or opens one
                     "function_call" => {
                         let name = it.get("name").and_then(Value::as_str).unwrap_or("");
                         let args = it.get("arguments").and_then(Value::as_str).unwrap_or("{}");
                         let id = it.get("call_id").and_then(Value::as_str).unwrap_or("");
-                        msgs.push(json!({
-                            "role": "assistant",
-                            "tool_calls": [{"id": id, "type": "function",
-                                            "function": {"name": name, "arguments": args}}]
-                        }));
+                        let call = json!({"id": id, "type": "function",
+                                          "function": {"name": name, "arguments": args}});
+                        match msgs.last_mut() {
+                            Some(turn) if turn_open => {
+                                match turn.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                                    Some(calls) => calls.push(call),
+                                    None => turn["tool_calls"] = json!([call]),
+                                }
+                            }
+                            _ => {
+                                let mut m = json!({"role": "assistant", "tool_calls": [call]});
+                                if let Some(r) = pending_reasoning.take() {
+                                    m["reasoning_content"] = json!(r);
+                                }
+                                msgs.push(m);
+                                turn_open = true;
+                            }
+                        }
                     }
                     // Consumed elsewhere in the pipeline rather than as a
                     // conversation turn: resume_decisions reads these to
@@ -910,12 +944,19 @@ pub async fn handle(
 
     // Round-tripped compaction items rewrite the conversation first (active
     // on every request, config or not): everything before the last one
-    // collapses into its summary, exactly reproducing what the compacting
-    // request rendered - the radix-cache invariant. Then a compaction_trigger
+    // collapses into it, exactly reproducing what the compacting request
+    // rendered - the radix-cache invariant. A v2 item's state is taken out
+    // here (it and everything before it leave the input) and rendered in
+    // front of the remaining items once their attachments are expanded; a
+    // legacy plaintext one rewrites in place. Then a compaction_trigger
     // (must be the final item) forces a compact-now of the whole input.
     let mut compact_trigger = false;
+    let mut oa_prev: Option<crate::context_management::OaState> = None;
     if let Value::Array(items) = &mut req.input {
-        if let Some(rw) = crate::context_management::oa_resend_rewrite(items) {
+        oa_prev = crate::context_management::oa_take_state(items);
+        if oa_prev.is_none()
+            && let Some(rw) = crate::context_management::oa_resend_rewrite(items)
+        {
             *items = rw;
         }
         compact_trigger = match crate::context_management::oa_take_trigger(items) {
@@ -979,6 +1020,19 @@ pub async fn handle(
         other => other,
     };
 
+    // The window's own items after the last compaction state (expanded):
+    // what a compaction plans over (kept only when one may run). Then the
+    // state renders in front of them.
+    let oa_after: Vec<Value> = if compact_threshold.is_some() || compact_trigger {
+        req.input.as_array().cloned().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if let Some(st) = &oa_prev
+        && let Value::Array(items) = &mut req.input
+    {
+        *items = crate::context_management::oa_render(st, items);
+    }
     let mut messages = match messages_from_input(req.instructions.as_deref(), &req.input) {
         Ok(m) => m,
         Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
@@ -1010,7 +1064,8 @@ pub async fn handle(
     // the wrong trade (the render simply misses them; same as
     // POST /v1/responses/compact).
     if compact_trigger {
-        return run_compact_trigger(state.clone(), req, messages, scope).await;
+        let plan = crate::context_management::oa_plan(oa_prev.as_ref(), &oa_after, None);
+        return run_compact_trigger(state.clone(), req, messages, plan, scope).await;
     }
 
     // Server-run tools (MCP servers, web search): if the request enables any,
@@ -1050,7 +1105,7 @@ pub async fn handle(
                 &req,
                 &g.tools,
                 &mut messages,
-                compact_threshold,
+                compact_threshold.map(|t| (t, (oa_prev.as_ref(), oa_after.as_slice()))),
                 &scope,
             )
             .await
@@ -1102,17 +1157,20 @@ pub async fn handle(
         Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
     scope.tokenized(t_prep.elapsed());
-    // Configured compaction fires on the RENDERED token count, and only over
-    // a non-empty span (the whole prompt being the pending turn leaves
-    // nothing to summarize). It runs before the gate: a prompt past the
-    // threshold is usually also the one about to overflow.
+    // Configured compaction fires on the RENDERED token count, whenever
+    // there is something besides the kept messages to summarize - inside a
+    // long agent turn too (OpenAI's contract; see OaState). It runs before
+    // the gate: a prompt past the threshold is usually also the one about to
+    // overflow.
     if let Some(threshold) = compact_threshold
         && prepared.prompt_ids.len() as u64 >= threshold
-        && let Value::Array(items) = &req.input
-        && crate::context_management::oa_tail_start(items) > 0
+        && let Some(plan) = crate::context_management::oa_plan(
+            oa_prev.as_ref(),
+            &oa_after,
+            Some(crate::context_management::OaKeep::for_threshold(threshold)),
+        )
     {
-        let items = items.clone();
-        return run_compacting_oa(state.clone(), req, items, scope).await;
+        return run_compacting_oa(state.clone(), req, plan, scope).await;
     }
     // Over-window prompt: clean 400 at the edge for stream and non-stream alike
     // (a streaming request has committed its 200 SSE status before the engine's
@@ -1416,8 +1474,18 @@ async fn collect_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>)
 /// Streaming: emit the Responses event sequence for the text path plus
 /// function_call items. Event names match the OpenAI vocabulary; each carries
 /// a monotonic sequence_number.
-fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Response {
-    let sse = stream! {
+fn stream_response(meta: Meta, rx: UnboundedReceiver<TokenEvent>) -> Response {
+    streaming_response(response_events(meta, rx))
+}
+
+/// The typed event stream of one generation (`stream_response`'s body; a
+/// compacting request runs its summarization inside the stream first and
+/// then hands over to this).
+fn response_events(
+    mut meta: Meta,
+    mut rx: UnboundedReceiver<TokenEvent>,
+) -> impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static {
+    stream! {
         let mut sq = crate::responses_stream::Seq::default();
 
         let snapshot = response_object(&meta, "in_progress", vec![], None, None);
@@ -1598,8 +1666,7 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
         meta.attach_ocr_regions(&mut full, &ids);
         yield ev(event_name, json!({
             "type":event_name,"sequence_number":sq.next(),"response":full}));
-    };
-    streaming_response(sse)
+    }
 }
 
 fn ev(name: &str, data: Value) -> Result<Event, std::convert::Infallible> {
@@ -1646,621 +1713,10 @@ fn drop_leading_turn(messages: &mut Vec<Value>) -> usize {
     end - first
 }
 
-/// The Responses compaction item (openai 2.53.0 `ResponseCompactionItem`).
-/// `encrypted_content` is the required field the SDK types round-trip, so
-/// the plaintext summary lives there - no encryption theater on a local box
-/// (documented deviation; their servers encrypt because their state is
-/// private, ours is the caller's own conversation).
-fn compaction_item(summary: &str) -> Value {
-    json!({"id": format!("cp_{}", uuid::Uuid::new_v4().simple()),
-           "type": "compaction", "encrypted_content": summary})
-}
-
-/// A minimal ResponsesRequest for server-initiated passes (the standalone
-/// compact endpoint has its own request type). Built through serde so the
-/// field defaults stay defined in one place.
-fn blank_request() -> ResponsesRequest {
-    serde_json::from_value(json!({"model": "", "input": ""})).expect("minimal request parses")
-}
-
-/// Doctor a request clone for the summarization pass: greedy sampling, no
-/// output constraint, a summary-sized output cap, thinking off (suffix-only
-/// in every template family, so the span prefix still cache-matches the
-/// conversation being compacted). Tools stay in the render for the same
-/// prefix-match reason - unless the request hid them with tool_choice
-/// "none"; a forced tool_choice must not force the SUMMARY, so it relaxes
-/// to auto.
-fn greedy_for_summary(mut r: ResponsesRequest) -> ResponsesRequest {
-    r.temperature = Some(0.0);
-    r.presence_penalty = Some(0.0);
-    r.frequency_penalty = Some(0.0);
-    r.text = None;
-    r.max_output_tokens = Some(4096);
-    if r.tool_choice
-        .as_ref()
-        .is_some_and(|tc| tc.as_str() != Some("none"))
-    {
-        r.tool_choice = None;
-    }
-    let mut kw = r
-        .chat_template_kwargs
-        .as_ref()
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    kw.insert("enable_thinking".into(), json!(false));
-    r.chat_template_kwargs = Some(Value::Object(kw));
-    r.stream = false;
-    r.context_management = None;
-    r
-}
-
-/// One summarization generation over `msgs1` (which must end with the
-/// summarization instruction turn). Returns (summary, prompt_rows, cached,
-/// output_tokens); Err is a ready-to-return error response. A None summary
-/// is the failed-compaction case (the model produced nothing usable).
-/// `lenient_gate`: an over-window span reads as a FAILED compaction (None)
-/// instead of an error - in-create compaction is opportunistic and the
-/// request must fall through to `truncation:"auto"` when it's armed; the
-/// trigger and the standalone endpoint were ASKED to compact, so for them
-/// the loud over-window error stands.
-// Err is axum's own Response by design: a ready-to-return body, not a boxed error
-#[allow(clippy::result_large_err)]
-async fn summary_pass(
-    state: &Arc<AppState>,
-    model: &ServingModel,
-    req1: &ResponsesRequest,
-    msgs1: &[Value],
-    // The agent loop's discovered MCP tools: the span render must carry the
-    // same tools as the live conversation or its prefix diverges and the
-    // summarization prefill loses the radix hit that makes it nearly free.
-    extra_tools: &[Value],
-    scope: &crate::events::EventScope,
-    lenient_gate: bool,
-) -> Result<(Option<String>, usize, usize, usize), Response> {
-    let prepared = prepare(
-        model,
-        req1,
-        msgs1,
-        extra_tools,
-        state.output_caps(),
-        &state.sampling,
-    )
-    .map_err(|e| err(StatusCode::BAD_REQUEST, "invalid_request_error", e))?;
-    // even the span + instructions overflows: compaction cannot rescue this
-    // conversation
-    if let Some(e) = crate::chat::context_gate(
-        model,
-        prepared.engine_prompt.len(),
-        prepared.mm_chunks.as_deref(),
-        state.max_ctx,
-    ) {
-        if lenient_gate {
-            return Ok((None, 0, 0, 0));
-        }
-        return Err(crate::chat::engine_err(&e));
-    }
-    let constraint = instantiate_constraint(
-        &prepared.constraint_spec,
-        prepared.gate,
-        model,
-        prepared.think_budget.as_ref(),
-    );
-    let (tx, mut rx) = unbounded_channel();
-    let gen1 = GenRequest {
-        prompt: prepared.engine_prompt,
-        max_tokens: prepared.max_tokens,
-        sampler: prepared.sampler,
-        stop_tokens: prepared.stop_tokens,
-        events: tx,
-        mm_chunks: prepared.mm_chunks,
-        constraint,
-        logprobs: None,
-        submitted: None, // stamped by Engine::submit
-        canvas_read: None,
-        user_turn: false,
-    };
-    if let Err(e) = model.engine.submit(gen1) {
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e));
-    }
-    let mut ids: Vec<u32> = Vec::new();
-    let mut cached = 0usize;
-    let mut p_len = prepared.prompt_ids.len();
-    let mut terminal_tokens = 0;
-    while let Some(evt) = rx.recv().await {
-        match evt {
-            TokenEvent::Prefilled { cached: c, rows } => {
-                cached = c as usize;
-                p_len = p_len.max(rows as usize);
-            }
-            TokenEvent::Token { id: t, .. } => ids.push(t),
-            TokenEvent::Done(_, stats) => {
-                terminal_tokens = stats.terminal_tokens();
-                scope.phases(&stats);
-                break;
-            }
-            TokenEvent::Error(e) => return Err(crate::chat::engine_err(&e)),
-        }
-    }
-    let raw = model.tokenizer.decode(&ids, false).unwrap_or_default();
-    let parsed = parse(model.dialect, &raw, prepared.thinking_open, None);
-    let summary = parsed
-        .content
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    Ok((summary, p_len, cached, ids.len() + terminal_tokens))
-}
-
-/// Round-0 context management for the agent loop. The
-/// compaction orchestration runs once, here, on the request's own prompt -
-/// the same measurement point a non-agent request uses - and never again
-/// inside the loop. Three reasons that is the right pin, not a shortcut:
-/// - the compact SPAN is fixed for the whole loop (the loop only appends
-///   after the pending user item), so compacting at round 5 would remove
-///   exactly what compacting here removes;
-/// - firing before the first generation keeps the compaction item at
-///   output[0], which is the single-shot contract AND the only position
-///   where the spec'd resend rewrite ("everything before the item collapses
-///   into its summary") is true of our summary - an item emitted mid-loop
-///   would tell the client to drop tool round-trips the summary never saw;
-/// - mid-turn tool bloat is the Anthropic dialect's `clear_tool_uses` job,
-///   and `truncation:"auto"` backstops it here (applied every round).
-///   Returns the compaction item to lead the output with. None = no threshold,
-///   trigger unmet, empty span, or a failed summarization - the absent item is
-///   the OpenAI dialect's "compaction did not happen" signal. Err = a
-///   ready-to-return error response.
-// Err is axum's own Response by design: a ready-to-return body, not a boxed error
-#[allow(clippy::too_many_arguments, clippy::result_large_err)]
-async fn precompact_agent(
-    state: &Arc<AppState>,
-    model: &ServingModel,
-    req: &ResponsesRequest,
-    extra_tools: &[Value],
-    messages: &mut Vec<Value>,
-    threshold: Option<u64>,
-    scope: &crate::events::EventScope,
-) -> Result<Option<Value>, Response> {
-    let Some(threshold) = threshold else {
-        return Ok(None);
-    };
-    let Value::Array(items) = &req.input else {
-        return Ok(None);
-    };
-    let tail_start = crate::context_management::oa_tail_start(items);
-    if tail_start == 0 {
-        return Ok(None); // the whole input is the pending turn: nothing to summarize
-    }
-    // one extra render+tokenize, and only for a request that armed the
-    // threshold: the loop's round 0 re-prepares over the compacted messages
-    let prepared = prepare(
-        model,
-        req,
-        messages,
-        extra_tools,
-        state.output_caps(),
-        &state.sampling,
-    )
-    .map_err(|e| err(StatusCode::BAD_REQUEST, "invalid_request_error", e))?;
-    if (prepared.prompt_ids.len() as u64) < threshold {
-        return Ok(None);
-    }
-    let span = Value::Array(items[..tail_start].to_vec());
-    let mut msgs1 = messages_from_input(req.instructions.as_deref(), &span)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, "invalid_request_error", e))?;
-    msgs1.push(json!({"role": "user",
-                      "content": crate::context_management::DEFAULT_COMPACT_INSTRUCTIONS}));
-    let req1 = greedy_for_summary(req.clone());
-    let (summary, ..) = summary_pass(state, model, &req1, &msgs1, extra_tools, scope, true).await?;
-    // failed summary -> the loop runs uncompacted with no item, exactly as the
-    // single-shot path does (and truncation "auto", if armed, still catches
-    // an over-window prompt inside the loop)
-    let Some(s) = summary else { return Ok(None) };
-    let items2 = crate::context_management::oa_compacted_items(items, &s);
-    *messages = messages_from_input(req.instructions.as_deref(), &Value::Array(items2))
-        .map_err(|e| err(StatusCode::BAD_REQUEST, "invalid_request_error", e))?;
-    Ok(Some(compaction_item(&s)))
-}
-
-/// The in-create compaction orchestration (`context_management` threshold
-/// met): iteration 1 summarizes the span greedily, iteration 2 answers over
-/// [framed summary + tail]. Same cache algebra as the /v1/messages twin:
-/// iteration 1 renders [same system, same tools, span, instructions] so its
-/// prefill rides the radix cache of the conversation being compacted, and
-/// iteration 2's item list is exactly what a later resend rewrites to.
-/// The official Response has no `usage.iterations` slot, so the pass's own
-/// numbers stay off the wire; top-level usage covers the final generation.
-async fn run_compacting_oa(
-    state: Arc<AppState>,
-    req: ResponsesRequest,
-    items: Vec<Value>,
-    scope: crate::events::EventScope,
-) -> Response {
-    let Some(model) = state.serving.as_ref() else {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "model_not_loaded",
-            "no model is loaded",
-        );
-    };
-    let tail_start = crate::context_management::oa_tail_start(&items);
-    let span = Value::Array(items[..tail_start].to_vec());
-    let mut msgs1 = match messages_from_input(req.instructions.as_deref(), &span) {
-        Ok(m) => m,
-        Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
-    };
-    msgs1.push(json!({"role": "user",
-                      "content": crate::context_management::DEFAULT_COMPACT_INSTRUCTIONS}));
-    let req1 = greedy_for_summary(req.clone());
-    let (summary, _p1_len, _cached1, _out1) =
-        match summary_pass(&state, model, &req1, &msgs1, &[], &scope, true).await {
-            Ok(x) => x,
-            Err(r) => return r,
-        };
-
-    // iteration 2: the real generation over [framed summary + tail]. A
-    // failed summary proceeds UNCOMPACTED with no compaction item - the
-    // OpenAI dialect has no failed-compaction shape, and the absent item is
-    // the honest signal (documented pin); if the uncompacted prompt then
-    // overflows, the loud gate error stands.
-    let items2 = match &summary {
-        Some(s) => crate::context_management::oa_compacted_items(&items, s),
-        None => items,
-    };
-    let mut messages = match messages_from_input(req.instructions.as_deref(), &Value::Array(items2))
-    {
-        Ok(m) => m,
-        Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
-    };
-    let mut prepared = match prepare(
-        model,
-        &req,
-        &messages,
-        &[],
-        state.output_caps(),
-        &state.sampling,
-    ) {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
-    };
-    // Same truncation:"auto" fallback as the plain path: an armed backstop
-    // must catch the compaction-couldn't-run corner too (span over-window ->
-    // failed compaction -> the uncompacted prompt still overflows), or the
-    // combination the Studio sends would 400 exactly where it opted into
-    // being saved. Without "auto" the loud gate error stands, as pinned.
-    let mut dropped = 0usize;
-    while let Some(e) = crate::chat::context_gate(
-        model,
-        prepared.engine_prompt.len(),
-        prepared.mm_chunks.as_deref(),
-        state.max_ctx,
-    ) {
-        if req.truncation.as_deref() != Some("auto") {
-            return crate::chat::engine_err(&e);
-        }
-        let n = drop_leading_turn(&mut messages);
-        if n == 0 {
-            return crate::chat::engine_err(&e);
-        }
-        dropped += n;
-        prepared = match prepare(
-            model,
-            &req,
-            &messages,
-            &[],
-            state.output_caps(),
-            &state.sampling,
-        ) {
-            Ok(p) => p,
-            Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
-        };
-    }
-    let meta = Meta {
-        id: format!("resp_{}", uuid::Uuid::new_v4().simple()),
-        model_id: model.id.clone(),
-        tokenizer: model.tokenizer.clone(),
-        prompt_len: prepared.prompt_ids.len(),
-        text_prompt_len: prepared.engine_prompt.len(),
-        media_is_audio: model.supports_audio,
-        dialect: model.dialect,
-        thinking_open: prepared.thinking_open,
-        hints: prepared.hints.clone(),
-        single_tool_call: prepared.single_tool_call,
-        instructions: req.instructions.clone(),
-        max_output_tokens: prepared.max_tokens,
-        max_tool_calls: req.max_tool_calls,
-        // echo what this turn was actually sampled at
-        temperature: req
-            .temperature
-            .unwrap_or(state.sampling.resolve(prepared.thinking_open).temp),
-        top_p: req
-            .top_p
-            .unwrap_or(state.sampling.resolve(prepared.thinking_open).top_p),
-        tools: Value::Array(req.tools.clone().unwrap_or_default()),
-        tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
-        text_format: req
-            .text
-            .as_ref()
-            .and_then(|t| t.get("format"))
-            .cloned()
-            .unwrap_or_else(|| json!({"type": "text"})),
-        ex: Extras {
-            truncation_auto: req.truncation.as_deref() == Some("auto"),
-            dropped,
-            compaction: summary.as_deref().map(compaction_item),
-            enrichment: Vec::new(),
-            ocr: prepared.ocr.clone(),
-        },
-        want_logprobs: lane_want_logprobs(&req),
-        scope,
-    };
-    let constraint = instantiate_constraint(
-        &prepared.constraint_spec,
-        prepared.gate,
-        model,
-        prepared.think_budget.as_ref(),
-    );
-    let (tx, rx) = unbounded_channel();
-    let gen_req = GenRequest {
-        prompt: prepared.engine_prompt,
-        max_tokens: prepared.max_tokens,
-        sampler: prepared.sampler,
-        stop_tokens: prepared.stop_tokens,
-        events: tx,
-        mm_chunks: prepared.mm_chunks,
-        constraint,
-        logprobs: lane_want_logprobs(&req).then(|| req.top_logprobs.unwrap_or(0)),
-        submitted: None, // stamped by Engine::submit
-        canvas_read: None,
-        user_turn: false,
-    };
-    if let Err(e) = model.engine.submit(gen_req) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
-    }
-    if req.stream {
-        stream_response(meta, rx)
-    } else {
-        collect_response(meta, rx).await
-    }
-}
-
-/// `compaction_trigger` (final input item): summarize the whole conversation
-/// - no tail split, the caller is archiving - and answer with only the
-///   compaction item. The Responses twin of `pause_after_compaction`; usage
-///   covers the summarization pass, the only generation that ran.
-async fn run_compact_trigger(
-    state: Arc<AppState>,
-    req: ResponsesRequest,
-    mut messages: Vec<Value>,
-    scope: crate::events::EventScope,
-) -> Response {
-    let Some(model) = state.serving.as_ref() else {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "model_not_loaded",
-            "no model is loaded",
-        );
-    };
-    messages.push(json!({"role": "user",
-                         "content": crate::context_management::DEFAULT_COMPACT_ALL_INSTRUCTIONS}));
-    let req1 = greedy_for_summary(req.clone());
-    let (summary, p1_len, cached1, out1) =
-        match summary_pass(&state, model, &req1, &messages, &[], &scope, false).await {
-            Ok(x) => x,
-            Err(r) => return r,
-        };
-    let Some(s) = summary else {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "compaction produced an empty summary",
-        );
-    };
-    let item = compaction_item(&s);
-    let meta = Meta {
-        id: format!("resp_{}", uuid::Uuid::new_v4().simple()),
-        model_id: model.id.clone(),
-        tokenizer: model.tokenizer.clone(),
-        prompt_len: p1_len,
-        text_prompt_len: p1_len,
-        media_is_audio: model.supports_audio,
-        dialect: model.dialect,
-        thinking_open: false,
-        hints: None,
-        single_tool_call: req.parallel_tool_calls == Some(false),
-        instructions: req.instructions.clone(),
-        max_output_tokens: state.output_caps().resolve(req.max_output_tokens),
-        max_tool_calls: req.max_tool_calls,
-        // the compaction pass runs with thinking closed, so it echoes the
-        // instruct-side election
-        temperature: req
-            .temperature
-            .unwrap_or(state.sampling.resolve(false).temp),
-        top_p: req.top_p.unwrap_or(state.sampling.resolve(false).top_p),
-        tools: Value::Array(req.tools.clone().unwrap_or_default()),
-        tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
-        text_format: req
-            .text
-            .as_ref()
-            .and_then(|t| t.get("format"))
-            .cloned()
-            .unwrap_or_else(|| json!({"type": "text"})),
-        ex: Extras::default(),
-        // a compaction answer has no message text for entries to ride on
-        want_logprobs: false,
-        scope,
-    };
-    meta.scope.usage(p1_len, out1);
-    meta.scope.cached(cached1);
-    meta.scope.finish("compaction");
-    let full = response_object(
-        &meta,
-        "completed",
-        vec![item.clone()],
-        Some((out1, 0, cached1)),
-        None,
-    );
-    if req.stream {
-        let snap = response_object(&meta, "in_progress", vec![], None, None);
-        let sse = stream! {
-            let mut seq = 0u64;
-            let mut next = || { let s = seq; seq += 1; s };
-            yield ev("response.created", json!({
-                "type":"response.created","sequence_number":next(),"response":snap}));
-            yield ev("response.in_progress", json!({
-                "type":"response.in_progress","sequence_number":next(),"response":snap}));
-            yield ev("response.output_item.added", json!({
-                "type":"response.output_item.added","sequence_number":next(),
-                "output_index":0,"item":item}));
-            yield ev("response.output_item.done", json!({
-                "type":"response.output_item.done","sequence_number":next(),
-                "output_index":0,"item":item}));
-            yield ev("response.completed", json!({
-                "type":"response.completed","sequence_number":next(),"response":full}));
-        };
-        return streaming_response(sse);
-    }
-    Json(full).into_response()
-}
-
-/// `POST /v1/responses/compact` (openai 2.53.0): the compaction executor
-/// standalone. Returns their `CompactedResponse` shape - object
-/// "response.compaction", output = the conversation's user message items
-/// followed by one compaction item, usage = the summarization pass. The
-/// summarization prefill rides the radix cache of the conversation being
-/// compacted when the conversation was served tool-less with the same
-/// instructions (this endpoint has no tools parameter on the wire).
-pub async fn handle_compact(
-    State(state): State<Arc<AppState>>,
-    scope: Option<axum::Extension<crate::events::EventScope>>,
-    crate::extract::OaiJson(req): crate::extract::OaiJson<paddock_api::responses::CompactRequest>,
-) -> Response {
-    let scope = scope.map(|e| e.0).unwrap_or_default();
-    let Some(model) = state.serving.as_ref() else {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "model_not_loaded",
-            "no model is loaded",
-        );
-    };
-    scope.model(&model.id);
-    if req.previous_response_id.is_some() {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "unsupported_parameter",
-            "responses are not persisted on this server; send the full conversation as input",
-        );
-    }
-    let mut items = match &req.input {
-        Value::String(s) => vec![json!({"type": "message", "role": "user", "content": s})],
-        Value::Array(a) => a.clone(),
-        _ => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "`input` must be a string or an array of input items",
-            );
-        }
-    };
-    // an already-compacted conversation re-compacts over its rewritten form;
-    // a stray compaction_trigger is redundant here (this endpoint is the
-    // trigger) and is consumed, but still must be the final item
-    if let Some(rw) = crate::context_management::oa_resend_rewrite(&items) {
-        items = rw;
-    }
-    if let Err(e) = crate::context_management::oa_take_trigger(&mut items) {
-        return err(StatusCode::BAD_REQUEST, "invalid_request_error", e);
-    }
-    if items.is_empty() {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "nothing to compact",
-        );
-    }
-    // attachments expand exactly like create, so the summary covers file
-    // CONTENT, not filenames
-    let opts = match crate::chat::attach_opts(None, None, None, None) {
-        Ok(o) => o,
-        Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
-    };
-    // Internal compaction/summary pass - not a user-facing response, so no
-    // forensics output item; injection into the summarized prompt is enough.
-    let compact_map =
-        match crate::chat::expand_attachments(&state, model, &mut items, opts, &mut Vec::new())
-            .await
-        {
-            Ok(sample) => sample,
-            Err((code, msg)) => {
-                let kind = if code == StatusCode::BAD_REQUEST {
-                    "invalid_request_error"
-                } else {
-                    "internal_error"
-                };
-                return err(code, kind, msg);
-            }
-        };
-    let mut msgs1 =
-        match messages_from_input(req.instructions.as_deref(), &Value::Array(items.clone())) {
-            Ok(m) => m,
-            Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
-        };
-    // A summary pass reads the same prompt the answer would, capability and
-    // all - otherwise the two disagree about what the model was told, and the
-    // prefix cache is aligned against a prompt that never ran.
-    if let Some(sample) = compact_map.as_deref() {
-        crate::doc::add_map_capability(&mut msgs1, sample);
-    }
-    msgs1.push(json!({"role": "user",
-                      "content": crate::context_management::DEFAULT_COMPACT_ALL_INSTRUCTIONS}));
-    let req1 = greedy_for_summary(blank_request());
-    let (summary, p1_len, cached1, out1) =
-        match summary_pass(&state, model, &req1, &msgs1, &[], &scope, false).await {
-            Ok(x) => x,
-            Err(r) => return r,
-        };
-    let Some(s) = summary else {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "compaction produced an empty summary",
-        );
-    };
-    scope.usage(p1_len, out1);
-    scope.cached(cached1);
-    scope.finish("compaction");
-    // their documented output: "a list of all user messages, followed by a
-    // single compaction item" - the user items echo verbatim (they are
-    // already valid input items for the next request), with the "message"
-    // discriminator made explicit so SDK unions parse the echo
-    let mut output: Vec<Value> = items
-        .iter()
-        .filter(|it| crate::context_management::oa_user_message(it))
-        .cloned()
-        .map(|mut it| {
-            if it.get("type").is_none() {
-                it["type"] = json!("message");
-            }
-            it
-        })
-        .collect();
-    output.push(compaction_item(&s));
-    Json(json!({
-        "id": format!("cr_{}", uuid::Uuid::new_v4().simple()),
-        "created_at": now_secs(),
-        "object": "response.compaction",
-        "output": output,
-        "usage": {
-            "input_tokens": p1_len,
-            "input_tokens_details": paddock_api::completions::Usage::media_details(p1_len, cached1, 0, false),
-            "output_tokens": out1,
-            "output_tokens_details": {"reasoning_tokens": 0},
-            "total_tokens": p1_len + out1,
-        },
-    }))
-    .into_response()
-}
+#[path = "responses_compact.rs"]
+mod compact;
+pub use compact::handle_compact;
+use compact::{precompact_agent, run_compact_trigger, run_compacting_oa};
 
 // ── MCP agent loop ──────────────────────────────────────────────────────────
 
@@ -4722,631 +4178,5 @@ fn stream_agent(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn quiet_response_stream_sends_comments_without_fabricating_events() {
-        use http_body_util::BodyExt;
-        let mut body = streaming_response(futures::stream::pending()).into_body();
-        let frame = tokio::time::timeout(Duration::from_secs(30), body.frame())
-            .await
-            .expect("quiet vision stream must not remain idle")
-            .expect("stream stays open")
-            .expect("body frame");
-        let bytes = frame.into_data().expect("keepalive data");
-        let text = std::str::from_utf8(&bytes).expect("UTF-8 comment");
-        assert!(text.starts_with(':') && text.ends_with("\n\n"));
-        assert!(!text.contains("data:") && !text.contains("event:"));
-    }
-
-    fn forensics_runtime() -> std::sync::Arc<crate::forensics::ForensicRuntime> {
-        crate::forensics::ForensicRuntime::build(&crate::config::ForensicsConfig {
-            enabled: true,
-            auto: crate::config::ForensicsAuto::Off,
-            tool: true,
-            device: None,
-        })
-        .expect("runtime builds when enabled")
-    }
-
-    /// A deterministic checkerboard|smooth PNG that fires ELA, as a data-URI
-    /// chat message (the shape the tool resolves images from).
-    fn image_message() -> Value {
-        use base64::Engine as _;
-        use image::{ExtendedColorType, ImageEncoder};
-        let (w, h) = (512u32, 512u32);
-        let mut rgb = vec![0u8; (w * h * 3) as usize];
-        for y in 0..h {
-            for x in 0..w {
-                let i = ((y * w + x) * 3) as usize;
-                let v: u8 = if x < 256 {
-                    if (x + y) & 1 == 0 { 0 } else { 255 }
-                } else {
-                    (y * 255 / h) as u8
-                };
-                rgb[i] = v;
-                rgb[i + 1] = v;
-                rgb[i + 2] = v;
-            }
-        }
-        // JPEG so ELA applies (ela is JPEG-only, per the reference should_skip).
-        let mut jpg = std::io::Cursor::new(Vec::new());
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 92)
-            .write_image(&rgb, w, h, ExtendedColorType::Rgb8)
-            .expect("encode jpeg");
-        let b64 = base64::engine::general_purpose::STANDARD.encode(jpg.into_inner());
-        json!({"role":"user","content":[
-            {"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{b64}")}}
-        ]})
-    }
-
-    #[test]
-    fn forensics_tool_type_is_served_and_dropped_from_function_defs() {
-        // The gate the live smoke test caught: `{"type":"forensics"}` must pass
-        // request validation (served) and be dropped from the function defs
-        // (handled by gather, like web_search/mcp), not 400 as "unsupported".
-        assert!(served_tool_type(Some("forensics")));
-        let out = normalize_tools(&[json!({"type": "forensics"})]).expect("forensics is served");
-        assert!(
-            out.is_empty(),
-            "forensics is handled by gather, not a function def"
-        );
-        // an unknown type still errors loudly (no silent drop)
-        assert!(normalize_tools(&[json!({"type": "file_search"})]).is_err());
-    }
-
-    #[test]
-    fn clock_tool_type_is_served_and_dropped_from_function_defs() {
-        assert!(served_tool_type(Some("current_time")));
-        let out =
-            normalize_tools(&[json!({"type": "current_time", "timezone": "Europe/Stockholm"})])
-                .expect("current_time is served");
-        assert!(
-            out.is_empty(),
-            "current_time is handled by gather, not a function def"
-        );
-    }
-
-    #[test]
-    fn clock_tool_classifies_only_when_gathered() {
-        let mut g = one_tool_gathered();
-        g.current_time = Some(
-            crate::clock::parse_spec(
-                &json!({"type": "current_time", "timezone": "Europe/Stockholm"}),
-            )
-            .expect("valid zone"),
-        );
-        assert!(
-            matches!(
-                classify_call(crate::clock::TOOL_NAME, "{}", &g),
-                Some(CallKind::Clock)
-            ),
-            "expected a Clock call"
-        );
-        // Not gathered -> a caller's own function of the same name passes through.
-        g.current_time = None;
-        assert!(classify_call(crate::clock::TOOL_NAME, "{}", &g).is_none());
-    }
-
-    #[test]
-    fn forensics_tool_classifies_only_when_gathered() {
-        let mut g = one_tool_gathered();
-        g.forensics = Some(forensics_runtime());
-        match classify_call(crate::forensics::TOOL_NAME, "{}", &g) {
-            Some(CallKind::Forensics { image_index }) => assert_eq!(image_index, None),
-            _ => panic!("expected a Forensics call"),
-        }
-        match classify_call(crate::forensics::TOOL_NAME, r#"{"image_index":2}"#, &g) {
-            Some(CallKind::Forensics { image_index }) => assert_eq!(image_index, Some(2)),
-            _ => panic!("expected a Forensics call carrying the index"),
-        }
-        // Not gathered -> a caller's own function of the same name passes through.
-        g.forensics = None;
-        assert!(classify_call(crate::forensics::TOOL_NAME, "{}", &g).is_none());
-    }
-
-    #[tokio::test]
-    async fn forensics_tool_executes_over_conversation_image() {
-        let rt = forensics_runtime();
-        let messages = vec![image_message()];
-        let (content, output, error, status) = run_forensics_tool(&rt, &messages, None).await;
-        assert_eq!(status, "completed");
-        assert!(error.is_none());
-        assert!(output.is_some());
-        assert!(
-            content.contains("ela_block_outliers"),
-            "tool result should carry the finding: {content}"
-        );
-
-        // No image in the conversation -> a clean failed status, never a panic.
-        let (_c, _o, err, status) = run_forensics_tool(&rt, &[], None).await;
-        assert_eq!(status, "failed");
-        assert!(err.is_some());
-    }
-
-    /// A two-tool `Gathered` with no servers to talk to: enough for the
-    /// classification and ledger decisions, which is all that runs here.
-    fn one_tool_gathered() -> Gathered {
-        let cfg = paddock_mcp::ServerConfig {
-            id: "test".into(),
-            label: "artifacts".into(),
-            transport: paddock_mcp::Transport::Http {
-                url: "http://localhost/mcp".into(),
-                headers: HashMap::new(),
-            },
-        };
-        let schema = json!({"type":"object","properties":{"artifact_id":{"type":"string"}},
-                            "required":["artifact_id"]});
-        Gathered {
-            tools: vec![],
-            routing: HashMap::from([(
-                "artifacts__artifact_read".to_string(),
-                (cfg, "artifact_read".to_string()),
-            )]),
-            needs_approval: HashSet::new(),
-            listings: vec![],
-            catalog: vec![crate::tool_search::CatalogTool {
-                name: "artifacts__artifact_read".into(),
-                description: "read one".into(),
-                input_schema: schema,
-            }],
-            web_search: None,
-            forensics: None,
-            current_time: None,
-            instructions: vec![],
-        }
-    }
-
-    fn parsed_call(name: &str, arguments: &str) -> Parsed {
-        Parsed {
-            content: None,
-            reasoning: None,
-            tool_calls: vec![crate::parsers::ToolCallRaw {
-                name: name.into(),
-                arguments: arguments.into(),
-            }],
-            complete_calls: 1,
-        }
-    }
-
-    /// Budget lever 1 through the Responses classifier: the same call twice in a
-    /// turn comes back off the ledger, and a third time is refused.
-    #[test]
-    fn a_repeated_call_replays_then_is_refused() {
-        let g = one_tool_gathered();
-        let mut ledger = loop_budget::CallLedger::new();
-        let p = parsed_call("artifacts__artifact_read", r#"{"artifact_id":"a1"}"#);
-
-        let first = round_calls(&p, &g, &mut ledger);
-        let sig = match &first[0].kind {
-            CallKind::Invoke { .. } => first[0].sig.clone().expect("a call that runs is filed"),
-            other => panic!("expected an invoke: {:?}", std::mem::discriminant(other)),
-        };
-        ledger.record(&sig, true, "the page");
-
-        let second = round_calls(&p, &g, &mut ledger);
-        match &second[0].kind {
-            CallKind::Replay { ns_name, output } => {
-                assert_eq!(ns_name, "artifacts__artifact_read");
-                assert!(output.ends_with("the page"), "{output}");
-            }
-            _ => panic!("expected a replay"),
-        }
-        assert!(
-            second[0].sig.is_none(),
-            "a replay must not be filed as a run"
-        );
-
-        let third = round_calls(&p, &g, &mut ledger);
-        match &third[0].kind {
-            CallKind::Refuse { message, .. } => assert!(message.contains("twice"), "{message}"),
-            _ => panic!("expected a refusal"),
-        }
-    }
-
-    /// The wrapper and the direct call are one call: the resolver gives us the
-    /// resolved identity, and the ledger is keyed on it, so a model that switches
-    /// spelling mid-loop does not get a free round out of it.
-    #[test]
-    fn the_wrapper_and_the_direct_call_are_the_same_call() {
-        let g = one_tool_gathered();
-        let mut ledger = loop_budget::CallLedger::new();
-        let direct = parsed_call("artifacts__artifact_read", r#"{"artifact_id":"a1"}"#);
-        let sig = round_calls(&direct, &g, &mut ledger)[0]
-            .sig
-            .clone()
-            .expect("filed");
-        ledger.record(&sig, true, "the page");
-
-        let wrapped = parsed_call(
-            crate::tool_search::CALL_TOOL,
-            r#"{"name":"artifacts__artifact_read","arguments_json":"{\"artifact_id\":\"a1\"}"}"#,
-        );
-        match &round_calls(&wrapped, &g, &mut ledger)[0].kind {
-            CallKind::Replay { .. } => {}
-            _ => panic!("the same call through mcp_call_tool must hit the ledger"),
-        }
-    }
-
-    /// A round cut before any tool ran leaves the user's own turn last, and
-    /// back-to-back user turns is a shape some chat templates refuse. The
-    /// nudge joins that turn instead of opening another.
-    #[test]
-    fn the_answer_nudge_never_opens_a_second_user_turn() {
-        let mut msgs = vec![json!({"role":"user","content":"go"})];
-        push_answer_nudge(&mut msgs, "answer now");
-        assert_eq!(msgs.len(), 1);
-        assert!(
-            msgs[0]["content"]
-                .as_str()
-                .expect("text")
-                .ends_with("answer now")
-        );
-
-        // A multimodal user turn takes it as one more text part.
-        let mut msgs = vec![json!({"role":"user","content":[{"type":"text","text":"go"}]})];
-        push_answer_nudge(&mut msgs, "answer now");
-        assert_eq!(msgs[0]["content"].as_array().expect("parts").len(), 2);
-
-        // After a tool round it is a turn of its own, which is the usual case.
-        let mut msgs = vec![json!({"role":"tool","content":"result","tool_call_id":"c1"})];
-        push_answer_nudge(&mut msgs, "answer now");
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[1]["role"], "user");
-    }
-
-    /// The caller's own `max_tool_calls`, through the same classifier.
-    /// The Nth+1 call is not dispatched - it comes back as a refusal naming
-    /// their knob - and the loop reads `limit_reached` to take the answer round.
-    #[test]
-    fn the_callers_max_tool_calls_stops_dispatch_and_then_the_turn() {
-        let g = one_tool_gathered();
-        let mut ledger = loop_budget::CallLedger::with_limit(Some(1));
-        let a = parsed_call("artifacts__artifact_read", r#"{"artifact_id":"a1"}"#);
-        let sig = round_calls(&a, &g, &mut ledger)[0]
-            .sig
-            .clone()
-            .expect("the first one runs");
-        ledger.record(&sig, true, "the page");
-        assert_eq!(
-            ledger.limit_reached(),
-            Some(loop_budget::Stop::ToolCalls(1))
-        );
-
-        // Different arguments, so this is a fresh call by every other rule -
-        // only the caller's ceiling stops it.
-        let b = parsed_call("artifacts__artifact_read", r#"{"artifact_id":"a2"}"#);
-        let calls = round_calls(&b, &g, &mut ledger);
-        match &calls[0].kind {
-            CallKind::Refuse { message, .. } => {
-                assert!(message.contains("max_tool_calls: 1"), "{message}");
-            }
-            _ => panic!("past the caller's limit nothing may be dispatched"),
-        }
-        assert!(calls[0].sig.is_none(), "a refusal is not a run");
-    }
-
-    /// A schema refusal never ran, so it must not consume a ledger slot -
-    /// otherwise a model that fixes its arguments on the retry would find its
-    /// corrected call counted as a repeat.
-    #[test]
-    fn a_schema_refusal_leaves_the_ledger_alone() {
-        let g = one_tool_gathered();
-        let mut ledger = loop_budget::CallLedger::new();
-        let bad = parsed_call("artifacts__artifact_read", r#"{}"#);
-        assert!(matches!(
-            round_calls(&bad, &g, &mut ledger)[0].kind,
-            CallKind::Refuse { .. }
-        ));
-        // ...and again, and it is still the SCHEMA refusal, not a repeat one.
-        match &round_calls(&bad, &g, &mut ledger)[0].kind {
-            CallKind::Refuse { message, .. } => {
-                assert!(message.contains("did not match its schema"), "{message}");
-            }
-            _ => panic!("expected the schema refusal both times"),
-        }
-        // The corrected call still runs.
-        let good = parsed_call("artifacts__artifact_read", r#"{"artifact_id":"a1"}"#);
-        assert!(matches!(
-            round_calls(&good, &g, &mut ledger)[0].kind,
-            CallKind::Invoke { .. }
-        ));
-    }
-
-    /// The invariant we asked for: the block lives in the SYSTEM slot, so a
-    /// compaction that rebuilds the messages from `req.instructions` re-renders
-    /// it. Putting it only in the message list meant the user's prompt survived
-    /// compaction and ours did not.
-    #[test]
-    fn server_instructions_go_into_the_system_slot_so_compaction_keeps_them() {
-        let merged = merge_instructions(Some("You are terse.".into()), &["Use artifacts.".into()]);
-        let sys = merged.expect("a system prompt");
-        // The user's line goes last: a short instruction stops being obeyed
-        // when 200 words of tool procedure trail it.
-        assert!(
-            sys.ends_with("You are terse."),
-            "the user's prompt must end it: {sys}"
-        );
-        assert!(
-            sys.starts_with("Use artifacts."),
-            "tool guidance leads: {sys}"
-        );
-        // Whatever a later rebuild does, it starts from this string.
-        let rebuilt = messages_from_input(Some(&sys), &json!("hi")).unwrap();
-        assert_eq!(rebuilt[0]["role"], "system");
-        assert!(
-            rebuilt[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Use artifacts.")
-        );
-    }
-
-    #[test]
-    fn merge_leaves_the_prompt_alone_when_no_server_speaks() {
-        assert_eq!(
-            merge_instructions(Some("mine".into()), &[]),
-            Some("mine".into())
-        );
-        assert_eq!(merge_instructions(None, &[]), None);
-    }
-
-    #[test]
-    fn merge_creates_the_prompt_when_the_user_set_none() {
-        assert_eq!(
-            merge_instructions(None, &["block".into()]),
-            Some("block".into())
-        );
-        assert_eq!(
-            merge_instructions(Some("   ".into()), &["block".into()]),
-            Some("block".into())
-        );
-    }
-
-    #[test]
-    fn server_instructions_append_to_the_users_system_prompt() {
-        // A server says how to use itself; it does not get to overwrite what
-        // the user asked for. Order matters: the user's prompt leads.
-        let mut msgs = vec![
-            json!({"role": "system", "content": "You are terse."}),
-            json!({"role": "user", "content": "hi"}),
-        ];
-        apply_server_instructions(&mut msgs, &["Put pages in artifacts.".to_string()]);
-        assert_eq!(msgs.len(), 2, "no extra system message when one exists");
-        let sys = msgs[0]["content"].as_str().unwrap();
-        assert!(
-            sys.ends_with("You are terse."),
-            "the user's prompt must end it: {sys}"
-        );
-        assert!(sys.starts_with("Put pages in artifacts."), "{sys}");
-    }
-
-    /// The seam that broke twice. On this API the system prompt is
-    /// `instructions`, not an item - so a capability applied inside attachment
-    /// expansion, which only ever sees the items, lands as a SECOND system
-    /// message after conversion. That is what shipped, and it is why a
-    /// geotagged photo never got its map: the model was told twice-removed or
-    /// not at all. The assertion that matters is the COUNT.
-    #[test]
-    fn the_map_capability_joins_the_instructions_system_turn() {
-        let mut msgs = messages_from_input(
-            Some("You are terse."),
-            &json!([{"role": "user", "content": "hi"}]),
-        )
-        .expect("converts");
-        crate::doc::add_map_capability(&mut msgs, "43.467448, 11.885127, Arezzo");
-        assert_eq!(
-            msgs.iter().filter(|m| m["role"] == "system").count(),
-            1,
-            "one system turn, never two: {msgs:?}"
-        );
-        let sys = msgs[0]["content"].as_str().expect("string content");
-        assert!(sys.contains("```map"), "the block must be shown: {sys}");
-        assert!(
-            sys.contains("43.467448, 11.885127, Arezzo"),
-            "ready to copy: {sys}"
-        );
-        assert!(
-            sys.ends_with("You are terse."),
-            "the caller keeps the tail: {sys}"
-        );
-        assert_eq!(msgs[1]["role"], "user", "the user turn stays after it");
-    }
-
-    /// ...and with no instructions at all, it is the system turn.
-    #[test]
-    fn the_map_capability_creates_the_system_turn_when_there_is_none() {
-        let mut msgs = messages_from_input(None, &json!([{"role": "user", "content": "hi"}]))
-            .expect("converts");
-        crate::doc::add_map_capability(&mut msgs, "43.4, 11.8, Arezzo");
-        assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[1]["role"], "user");
-    }
-
-    /// The third failure of the same seam, and the one `messages` alone cannot
-    /// survive: every compaction rebuilds the message list from
-    /// `req.instructions`, so a capability patched into `messages` is gone
-    /// while the photo line, which lives in the user item, sails through - the
-    /// model keeps the coordinates and loses the reason to draw them. The
-    /// handler folds it into the instructions slot; this pins that a rebuild
-    /// re-renders it.
-    #[test]
-    fn the_map_capability_survives_a_rebuild_from_instructions() {
-        let text = crate::doc::map_capability_text("43.467157, 11.885395, Arezzo");
-        let instructions =
-            merge_instructions(Some("You are terse.".into()), &[text]).expect("some instructions");
-        let rebuilt = messages_from_input(
-            Some(&instructions),
-            &json!([{"role": "user", "content": "hi"}]),
-        )
-        .expect("converts");
-        assert_eq!(
-            rebuilt.iter().filter(|m| m["role"] == "system").count(),
-            1,
-            "still one system turn: {rebuilt:?}"
-        );
-        let sys = rebuilt[0]["content"].as_str().expect("string content");
-        assert!(
-            sys.contains("```map"),
-            "the block survived the rebuild: {sys}"
-        );
-        assert!(
-            sys.ends_with("You are terse."),
-            "and the caller still owns the tail: {sys}"
-        );
-    }
-
-    #[test]
-    fn server_instructions_create_a_system_prompt_when_there_is_none() {
-        let mut msgs = vec![json!({"role": "user", "content": "hi"})];
-        apply_server_instructions(&mut msgs, &["Use artifacts.".to_string()]);
-        assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[0]["content"], "Use artifacts.");
-        assert_eq!(msgs[1]["role"], "user", "the user turn must stay after it");
-    }
-
-    #[test]
-    fn several_servers_are_joined_and_none_is_dropped() {
-        let mut msgs = vec![json!({"role": "user", "content": "hi"})];
-        apply_server_instructions(&mut msgs, &["First.".to_string(), "Second.".to_string()]);
-        let sys = msgs[0]["content"].as_str().unwrap();
-        assert!(sys.contains("First.") && sys.contains("Second."), "{sys}");
-    }
-
-    #[test]
-    fn no_instructions_changes_nothing() {
-        let before = vec![json!({"role": "user", "content": "hi"})];
-        let mut msgs = before.clone();
-        apply_server_instructions(&mut msgs, &[]);
-        assert_eq!(
-            msgs, before,
-            "a server with no instructions must not add a system turn"
-        );
-    }
-
-    #[test]
-    fn image_bearing_content_arrays_pass_through() {
-        let input = json!([{
-            "type": "message", "role": "user",
-            "content": [
-                {"type": "input_text", "text": "What is this?"},
-                {"type": "input_image", "image_url": "data:image/bmp;base64,AAAA"}
-            ]
-        }]);
-        let msgs = messages_from_input(None, &input).unwrap();
-        // array kept verbatim so the template renders the image_pad slot
-        assert!(msgs[0]["content"].is_array(), "{:?}", msgs[0]);
-        let urls = crate::chat::find_images(&msgs).unwrap();
-        assert_eq!(
-            urls.iter().map(|r| r.url.as_ref()).collect::<Vec<_>>(),
-            ["data:image/bmp;base64,AAAA"]
-        );
-    }
-
-    #[test]
-    fn text_only_content_arrays_flatten() {
-        let input = json!([{
-            "type": "message", "role": "user",
-            "content": [{"type": "input_text", "text": "hello "},
-                        {"type": "input_text", "text": "world"}]
-        }]);
-        let msgs = messages_from_input(None, &input).unwrap();
-        assert_eq!(msgs[0]["content"], "hello world");
-    }
-
-    /// Echoing the whole output array back is the documented multi-turn pattern
-    /// for Responses, and that array contains `reasoning` items - so refusing
-    /// them 400s a conforming client. It used to.
-    #[test]
-    fn a_reasoning_item_rides_on_the_assistant_message_it_precedes() {
-        let input = json!([
-            {"type": "message", "role": "user", "content": "q"},
-            {"type": "reasoning", "id": "rs_1", "summary": [],
-             "content": [{"type": "reasoning_text", "text": "let me think"}]},
-            {"type": "message", "role": "assistant", "content": "a"},
-            {"type": "message", "role": "user", "content": "q2"},
-        ]);
-        let msgs = messages_from_input(None, &input).unwrap();
-        // three turns, not four: the reasoning is a FIELD, never a turn of its own
-        assert_eq!(msgs.len(), 3, "reasoning must not become its own message");
-        assert_eq!(msgs[1]["role"], "assistant");
-        assert_eq!(msgs[1]["reasoning_content"], "let me think");
-        // and it attaches to the message that FOLLOWS it, not the one before
-        assert!(msgs[0].get("reasoning_content").is_none());
-        assert!(msgs[2].get("reasoning_content").is_none());
-    }
-
-    /// A provider that withholds the chain and ships only a summary still has
-    /// something to say; take it rather than drop the item silently.
-    #[test]
-    fn a_summary_only_reasoning_item_still_carries_its_text() {
-        let input = json!([
-            {"type": "reasoning", "id": "rs_1",
-             "summary": [{"type": "summary_text", "text": "considered options"}]},
-            {"type": "message", "role": "assistant", "content": "a"},
-        ]);
-        let msgs = messages_from_input(None, &input).unwrap();
-        assert_eq!(msgs[0]["reasoning_content"], "considered options");
-    }
-
-    /// An empty one attaches nothing rather than an empty string, so a template
-    /// that tests `is string` does not render a hollow think block for it.
-    #[test]
-    fn an_empty_reasoning_item_attaches_nothing() {
-        let input = json!([
-            {"type": "reasoning", "id": "rs_1", "summary": [], "content": []},
-            {"type": "message", "role": "assistant", "content": "a"},
-        ]);
-        let msgs = messages_from_input(None, &input).unwrap();
-        assert!(msgs[0].get("reasoning_content").is_none());
-    }
-
-    #[test]
-    fn truncation_drops_whole_turns_from_the_front() {
-        let mut msgs = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "q1"}),
-            json!({"role": "assistant", "content": "a1"}),
-            json!({"role": "user", "content": "q2"}),
-            json!({"role": "assistant", "content": "a2"}),
-            json!({"role": "user", "content": "pending"}),
-        ];
-        assert_eq!(drop_leading_turn(&mut msgs), 2, "q1 + a1 leave together");
-        assert_eq!(
-            msgs[0]["content"], "sys",
-            "the system turn is never dropped"
-        );
-        assert_eq!(msgs[1]["content"], "q2");
-        assert_eq!(drop_leading_turn(&mut msgs), 2);
-        // only the pending turn is left: nothing droppable, the caller 400s
-        assert_eq!(drop_leading_turn(&mut msgs), 0);
-        assert_eq!(msgs.len(), 2);
-    }
-
-    #[test]
-    fn truncation_never_eats_into_the_pending_turn() {
-        // an agent-loop round: the pending question, then tool round-trips.
-        // Dropping stops at the pending user message - draining into it would
-        // leave the model a dangling tool result with no request.
-        let mut msgs = vec![
-            json!({"role": "user", "content": "old"}),
-            json!({"role": "assistant", "content": "answer"}),
-            json!({"role": "user", "content": "pending"}),
-            json!({"role": "assistant", "tool_calls": [{"id": "c1"}]}),
-            json!({"role": "tool", "content": "result", "tool_call_id": "c1"}),
-        ];
-        assert_eq!(
-            drop_leading_turn(&mut msgs),
-            2,
-            "the finished exchange only"
-        );
-        assert_eq!(msgs[0]["content"], "pending");
-        assert_eq!(
-            drop_leading_turn(&mut msgs),
-            0,
-            "the turn in flight is untouchable"
-        );
-        assert_eq!(msgs.len(), 3);
-    }
-}
+#[path = "responses_tests.rs"]
+mod tests;

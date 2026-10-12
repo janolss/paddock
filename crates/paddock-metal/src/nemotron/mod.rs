@@ -8,6 +8,9 @@ use paddock_models::nemotron::NemotronBlock;
 use std::collections::VecDeque;
 mod forward;
 mod load;
+mod mlx;
+#[cfg(test)]
+mod mlx_tests;
 mod prefix;
 #[cfg(test)]
 mod prefix_tests;
@@ -25,8 +28,10 @@ const WINDOW: usize = CONV * 3;
 const FF: usize = 1856;
 const SHARED: usize = 3712;
 const CHUNK: usize = 512;
+const MLX_CHUNK: usize = 2048;
 const SPLITS: usize = 16;
 const PREFIX_PER_SLOT: usize = 2;
+const MLX_PREFIX_PER_SLOT: usize = 3;
 
 struct Mamba {
     input: Weight,
@@ -108,6 +113,8 @@ struct Slot {
     table: BlockTable,
     history: Vec<u32>,
     reused: usize,
+    prompt_end: usize,
+    tool_started: bool,
 }
 struct Pending {
     slot: usize,
@@ -128,6 +135,9 @@ pub struct Nemotron {
     // completion. Attention-only radix reuse is invalid for a Mamba model.
     prefixes: Vec<prefix::Checkpoint>,
     prefix_clock: u64,
+    // Tokenizer-derived trailing-whitespace tokens are unsafe reply cuts:
+    // template trimming can merge their final newline on a later user turn.
+    reply_trim_tokens: Vec<bool>,
     pool: KvPool,
     context: usize,
     page_stride: usize,
@@ -138,8 +148,35 @@ pub struct Nemotron {
     scan_only: bool,
     #[cfg(test)]
     single_snapshot: bool,
+    #[cfg(test)]
+    reference_inputs: Vec<Buffer>,
 }
 impl Nemotron {
+    fn mixed_row_cap(&self, decodes: usize) -> usize {
+        mixed_row_cap(
+            self.embedding.ty == mlx::AFFINE8 && self.device.tensor_accelerated(),
+            decodes,
+            self.scratch.ids.len() / 4,
+        )
+    }
+    fn pending_span(&self, offset: usize, length: usize) -> usize {
+        if self.embedding.ty != mlx::AFFINE8 {
+            return length - offset;
+        }
+        // Large cold work must not erase the first user anchor or the last
+        // resumable cut before a changed/truncated final token. Mixed work
+        // retains the shared 128-row latency cap independently of this arena.
+        let cut = if offset < CHUNK {
+            CHUNK
+        } else {
+            length.saturating_sub(1) / CHUNK * CHUNK
+        };
+        if offset < cut && cut < length {
+            cut - offset
+        } else {
+            length - offset
+        }
+    }
     fn copy_state(&self, dst: usize, src: Option<usize>) -> Result<()> {
         if let Some(src) = src {
             // Copy bytes, not arithmetic: one fenced blit replaces 46 compute
@@ -189,6 +226,25 @@ impl Nemotron {
                 "invalid Nemotron prefill slot/tokens/context".into(),
             ));
         }
+        // A warm HTTP tool turn is not a new conversation. Peers may be
+        // awaiting tool results with no occupied slot; keep their anchors.
+        // Only an admission outside the held conversations retires stale pins.
+        if !self
+            .prefixes
+            .iter()
+            .any(|c| c.anchor && tokens.starts_with(&c.history))
+        {
+            let active = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| *i != slot && !s.history.is_empty())
+                .map(|(_, s)| s.history.as_slice())
+                .chain(self.pending.iter().map(|p| p.tokens.as_slice()))
+                .chain(std::iter::once(tokens))
+                .collect::<Vec<_>>();
+            prefix::retain_active_anchors(&mut self.prefixes, &active);
+        }
         let matched = self
             .prefixes
             .iter()
@@ -214,11 +270,16 @@ impl Nemotron {
         }
         s.history.extend_from_slice(&tokens[..reused]);
         s.reused = reused;
+        s.prompt_end = tokens.len();
+        s.tool_started = false;
         Ok(reused)
     }
     fn publish(&mut self, slot: usize) -> Result<()> {
         let n = self.slots[slot].history.len();
-        if n == 0 || !n.is_multiple_of(BLOCK_TOKENS) {
+        // MLX fair-share grants need not end on a page boundary. Retain the
+        // complete state at their actual end; execute copy-on-writes the last
+        // attention page before either the live slot or a restore appends.
+        if n == 0 || (self.embedding.ty != mlx::AFFINE8 && !n.is_multiple_of(BLOCK_TOKENS)) {
             return Ok(());
         }
         let history = &self.slots[slot].history;
@@ -228,6 +289,9 @@ impl Nemotron {
             prefix::replacement(&self.prefixes, history)
         };
         let Some(index) = index else { return Ok(()) };
+        self.file_checkpoint(slot, index, false)
+    }
+    fn file_checkpoint(&mut self, slot: usize, index: usize, reply_candidate: bool) -> Result<()> {
         // Never leave an old key pointing at a partially overwritten state if
         // the copy fails. Only the successful fence publishes a new pairing.
         self.prefixes[index].clear(&mut self.pool);
@@ -240,6 +304,7 @@ impl Nemotron {
             .clone_from(&self.slots[slot].history);
         self.prefix_clock += 1;
         self.prefixes[index].touched = self.prefix_clock;
+        self.prefixes[index].reply_candidate = reply_candidate;
         Ok(())
     }
     fn prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -248,7 +313,12 @@ impl Nemotron {
         }
         let reused = self.prepare(slot, tokens)?;
         let mut last = Vec::new();
-        for chunk in tokens[reused..].chunks(CHUNK) {
+        let mut offset = reused;
+        while offset < tokens.len() {
+            let count = self
+                .pending_span(offset, tokens.len())
+                .min(self.scratch.ids.len() / 4);
+            let chunk = &tokens[offset..offset + count];
             let pos = self.slots[slot].history.len();
             let rows = chunk
                 .iter()
@@ -262,7 +332,20 @@ impl Nemotron {
             };
             last = self.execute(&rows, &output)?;
             self.publish(slot)?;
+            offset += count;
         }
         Ok(last)
+    }
+}
+
+fn mixed_row_cap(mlx_tensor: bool, decodes: usize, capacity: usize) -> usize {
+    if mlx_tensor && decodes > 0 {
+        // Qualify the allowance in prompt rows, separately from live decodes.
+        // At 8K/16K depth the 128-row pass is dominated by fixed expert work;
+        // a 512-row ceiling lets the shared measured-cost pacer find the knee.
+        // It remains free to shrink the grant, never exceed this fixed arena.
+        decodes.saturating_add(512).min(capacity)
+    } else {
+        crate::schedule::row_cap(decodes, capacity)
     }
 }

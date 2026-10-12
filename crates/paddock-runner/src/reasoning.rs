@@ -356,6 +356,21 @@ pub(crate) fn stop_policy(
     Some(paddock_engine::sampler::ReasoningStop { leave, exit })
 }
 
+/// The thinking governor for a compaction's summarization pass: that pass
+/// renders with the conversation's own thinking config (so its prefix rides
+/// the radix cache of the conversation being compacted), and an open think
+/// block is closed after one token by the budget's exit sequence, so the
+/// output budget goes to the summary. None when thinking is not open, or on
+/// a family whose reasoning the budget cannot close (it then thinks first).
+pub(crate) fn summary_think_close(
+    model: &crate::serving::ServingModel,
+    thinking_open: bool,
+) -> Option<crate::chat::ThinkBudget> {
+    thinking_open
+        .then(|| crate::chat::think_budget(model, 1, true, "the summarization pass").ok())
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

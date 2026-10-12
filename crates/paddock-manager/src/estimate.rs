@@ -440,10 +440,12 @@ pub(crate) fn artifact_shape(
 /// and live slots + one restore context + two staging blocks per slot with
 /// a tier (paddock-metal/qwen35/load.rs). Scale the catalog's maximum-envelope
 /// reservation for the concurrency actually requested. Nemotron likewise
-/// retains two complete checkpoints per live slot, but has no cold tier.
+/// retains two (GGUF) or three (MLX, including a reply boundary) complete
+/// checkpoints per live slot, but has no cold tier.
 pub(crate) fn metal_cache_shape(
     shape: &mut ModelShape,
     model: &crate::registry::CatalogModel,
+    artifact: Option<&crate::registry::CatalogArtifact>,
     env: &Envelope,
 ) {
     if matches!(
@@ -457,7 +459,12 @@ pub(crate) fn metal_cache_shape(
             2 * env.concurrency
         };
     } else if model.family.as_deref() == Some("nemotron-h") {
-        shape.kv_reserve_sequences = 2 * env.concurrency;
+        let retained = if artifact.is_some_and(|a| a.runtime.checkpoint_dir) {
+            3
+        } else {
+            2
+        };
+        shape.kv_reserve_sequences = retained * env.concurrency;
     }
 }
 
@@ -478,15 +485,15 @@ pub(crate) fn backend_estimate(
         .concurrency
         .max(1)
         .saturating_add(shape.kv_reserve_sequences);
-    // Qwen retains three recurrent/conv slots per live slot. The shared
-    // estimator already charged live state and checkpoint allowances; top
-    // that up if a larger batch exceeds that allowance.
+    // Qwen retains at least three recurrent/conv slots per live slot;
+    // Nemotron MLX now reserves four with its pre-tool reply checkpoint.
+    // Preserve the conservative convolution staging allowance, but never
+    // underprice the complete-state count elected by the artifact.
     if let Some(r) = &shape.recurrent {
         let held = result
             .state
             .saturating_add(result.overhead_parts.prefix_checkpoints);
-        let required = 3
-            * env.concurrency.max(1)
+        let required = sequences.max(3 * env.concurrency.max(1))
             * r.layers
             * (r.state_elems + 3 * r.conv_elems)
             * r.elem_bytes;
@@ -839,7 +846,7 @@ pub async fn handle(
             if state.readiness.backend == "metal"
                 && let Some(shape) = &mut shape
             {
-                metal_cache_shape(shape, m, &env);
+                metal_cache_shape(shape, m, Some(a), &env);
             }
             // What the row SAYS the weights cost: resident where we know it,
             // the file size otherwise - never a scaled guess. And the same
@@ -876,7 +883,7 @@ pub async fn handle(
                             };
                             let mut shape = shape.clone();
                             if state.readiness.backend == "metal" {
-                                metal_cache_shape(&mut shape, m, &env);
+                                metal_cache_shape(&mut shape, m, Some(a), &env);
                             }
                             let ctx =
                                 backend_estimate(&state.readiness.backend, &shape, &env, &dev)
@@ -1080,8 +1087,10 @@ mod tests {
         use paddock_estimator::{Device, Envelope, KvDtype};
         let registry = Registry::new(std::env::temp_dir()).with_backend("metal");
         let model = registry.catalog_of("nemotron-3.5-lightning-30b").unwrap();
-        let artifact = model.artifact("q8").unwrap();
-        for batch in [1, 4, 16, 64] {
+        for (format, retained, batch) in ["q8", "mlx-8bit"].into_iter().flat_map(|format| {
+            [1, 4, 16, 64].map(|batch| (format, if format == "q8" { 2 } else { 3 }, batch))
+        }) {
+            let artifact = model.artifact(format).unwrap();
             let mut shape = artifact.shape.clone().unwrap().into_model_shape(0, 0);
             artifact.runtime.memory.as_ref().unwrap().apply(&mut shape);
             shape.max_ctx = 4096;
@@ -1091,16 +1100,23 @@ mod tests {
                 spec: None,
                 offload: None,
             };
-            super::metal_cache_shape(&mut shape, model, &env);
-            assert_eq!(shape.kv_reserve_sequences, 2 * batch);
+            super::metal_cache_shape(&mut shape, model, Some(artifact), &env);
+            assert_eq!(shape.kv_reserve_sequences, retained * batch);
+            // Fit curves and admission retries project the already-projected
+            // shape again. Derive from the artifact, never from the prior total.
+            super::metal_cache_shape(&mut shape, model, Some(artifact), &env);
+            assert_eq!(shape.kv_reserve_sequences, retained * batch);
             let device = Device {
                 free_bytes: 100 << 30,
                 total_bytes: 128 << 30,
             };
             let estimate = super::backend_estimate("metal", &shape, &env, &device);
             assert_eq!(estimate.max_ctx, 4096);
-            assert_eq!(estimate.kv_pool, 4096 * 6 * 256 * 2 * 2 * (3 * batch));
-            let recurrent = 23 * (524288 + 18432) * 4 * (3 * batch);
+            assert_eq!(
+                estimate.kv_pool,
+                4096 * 6 * 256 * 2 * 2 * ((1 + retained) * batch)
+            );
+            let recurrent = 23 * (524288 + 18432) * 4 * ((1 + retained) * batch);
             assert!(estimate.state + estimate.overhead_parts.prefix_checkpoints >= recurrent);
             let exact = Device {
                 free_bytes: estimate.resident + estimate.kv_pool,
@@ -1134,7 +1150,7 @@ mod tests {
                 spec: None,
                 offload: None,
             };
-            super::metal_cache_shape(&mut shape, model, &env);
+            super::metal_cache_shape(&mut shape, model, Some(artifact), &env);
             assert_eq!(shape.kv_reserve_sequences, batch * 2);
             let device = Device {
                 free_bytes: 100 << 30,

@@ -1730,7 +1730,7 @@ async fn metal_admission(
             let mut s = shape.clone();
             s.max_ctx = ctx;
             if let Some(model) = model {
-                crate::estimate::metal_cache_shape(&mut s, model, &env);
+                crate::estimate::metal_cache_shape(&mut s, model, artifact, &env);
             }
             s
         };

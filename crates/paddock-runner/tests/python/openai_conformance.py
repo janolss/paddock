@@ -1001,10 +1001,11 @@ def sec_context_management(client, model):
         temperature=0.0, truncation="auto")
     assert r4.truncation == "auto", r4.truncation
 
-    # compaction + truncation "auto" together on a span past the window: the
-    # summarization pass cannot run, so compaction fails open (no item) and
-    # the truncation backstop drops leading turns and serves - this exact
-    # combination 400'd before the phase-4 fail-open fix.
+    # compaction + truncation "auto" together on a span past the window:
+    # the summarization pass rolls over the span in parts (one part could
+    # not hold it), so the compaction item still leads and the answer
+    # serves - before parts, this failed open (no item) onto the truncation
+    # backstop, and before the phase-4 fail-open fix it 400'd.
     heavy = " ".join(f"row-{i:04d} holds value {i * 7 % 991}." for i in range(900))
     r5 = client.responses.create(
         model=model, max_output_tokens=300, temperature=0.0,
@@ -1017,8 +1018,8 @@ def sec_context_management(client, model):
         context_management=[{"type": "compaction", "compact_threshold": 800}],
         truncation="auto",
     )
-    assert not [o for o in r5.output if o.type == "compaction"], "no item on an unsummarizable span"
-    assert r5.output_text.strip(), "the backstop must serve, not 400"
+    assert r5.output[0].type == "compaction", r5.output[0]
+    assert r5.output_text.strip(), "an over-window span must still be served, not 400"
     ok("responses context management (compaction + trigger + compact + truncation)")
 
 

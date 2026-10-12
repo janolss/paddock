@@ -2955,6 +2955,14 @@ fn build_generator(
                     })
                     .map_err(|e| e.to_string());
             }
+            if arch == "nemotron" && path.is_dir() {
+                if mmproj.is_some() || mtp.is_some() || fp8_native.is_some() || pack.is_some() {
+                    return Err("Nemotron MLX Metal is text-only without speculative companions or CUDA packs".into());
+                }
+                return paddock_metal::Nemotron::load(path, max_ctx, max_batch, vram_budget)
+                    .map(|m| Box::new(m) as Box<dyn Generator>)
+                    .map_err(|e| e.to_string());
+            }
             if arch == "llama" && path.is_dir() {
                 if mmproj.is_some() || mtp.is_some() || fp8_native.is_some() || pack.is_some() {
                     return Err("MiniCPM5 MLX Metal is text-only; speculative companions and CUDA packs are not implemented".into());

@@ -9,6 +9,41 @@ struct LibraryCatalogTests {
   @Test(
     .enabled(
       if: ProcessInfo.processInfo.environment["PADDOCK_MACOS_CONTRACT_DIR"] != nil,
+      "Requires the actual Rust registry projection."))
+  @MainActor func publishedNemotronMLXReachesNativeCatalogWithMetalDefaults() throws {
+    let path = try #require(ProcessInfo.processInfo.environment["PADDOCK_MACOS_CONTRACT_DIR"])
+    let catalog = try ManagerWire.decode(
+      ModelCatalog.self,
+      from: Data(contentsOf: URL(fileURLWithPath: path).appending(path: "catalog.json")))
+    for query in ["Nemotron", "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-8bit"] {
+      let entries = LibraryCatalog.entries(
+        catalog: catalog, backend: "metal", format: .mlx, query: query)
+      let entry = try #require(entries.first { $0.id == "nemotron-3.5-lightning-30b" })
+      #expect(entry.model.vendor == "NVIDIA")
+      #expect(entry.artifacts.map(\.id) == ["mlx-8bit"])
+      #expect(entry.initialArtifact == "mlx-8bit")
+      #expect(entry.capabilities == ["chat", "tools", "reasoning"])
+      let artifact = try #require(entry.preferredArtifact)
+      #expect(artifact.isMLX && artifact.default == true)
+      #expect(artifact.runtime?.checkpointDir == true)
+      #expect(artifact.runtime?.backends == ["metal"])
+      #expect(artifact.runtime?.defaultMaxCtx == 32768)
+      #expect(artifact.runtime?.defaultMaxBatch == 1)
+      #expect(artifact.runtime?.kvCacheDtype == "auto")
+      #expect(artifact.runtime?.companions == [])
+      #expect(artifact.source?.repo == "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-8bit")
+      #expect(ProviderArtwork.names[entry.model.vendor ?? ""] == "NVIDIA")
+      #expect(
+        LibraryCatalog.companions(model: entry.model, artifact: artifact, backend: "metal").isEmpty)
+      #expect(
+        LibraryCatalog.selection(nil, in: entries, backend: "metal")
+          == LibrarySelection(model: entry.id, artifact: "mlx-8bit"))
+    }
+  }
+
+  @Test(
+    .enabled(
+      if: ProcessInfo.processInfo.environment["PADDOCK_MACOS_CONTRACT_DIR"] != nil,
       "Run apps/macos/scripts/check.sh for the actual Rust registry projection."))
   @MainActor func publishedKolibriReachesNativeCatalogWithMakerAndMetalDefaults() throws {
     let path = try #require(ProcessInfo.processInfo.environment["PADDOCK_MACOS_CONTRACT_DIR"])

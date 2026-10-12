@@ -6,11 +6,14 @@
 //! - **Capacity slabs** ([`HostStore`]): where demoted payload extents live.
 //!   Allocated as ordinary pageable memory, touched, then registered once via
 //!   `cuMemHostRegister` - 5.9 ms/GiB vs 72-151 ms for
-//!   `cuMemHostAlloc`, and registered ≡ pinned ≡ 26.7 GB/s on the bus, so a
-//!   large T1 costs milliseconds to arm and DMA runs straight into it (no
-//!   bounce). Registration failing (WDDM working-set limits, exotic hosts) is
-//!   the loud fallback: the store keeps working pageable and transfers bounce
-//!   through the staging ring - slower, said once at WARN, never silent.
+//!   `cuMemHostAlloc`, and registered = pinned = 26.7 GB/s on the bus, so
+//!   DMA runs straight into it (no bounce). Arming is NOT milliseconds: the
+//!   touch that registration needs faults every page in, and that is what a
+//!   GiB costs (see `touch_pages`) - so slabs are built on their own thread
+//!   (`SlabSupply`), never on the serving path. Registration failing (WDDM
+//!   working-set limits, exotic hosts) is the loud fallback: the store keeps
+//!   working pageable and transfers bounce through the staging ring -
+//!   slower, said once at WARN, never silent.
 //! - **Staging ring** ([`StagingRing`]): a small bounded pool of
 //!   **cached-pinned** extents (`cuMemHostAlloc`, no write-combining - WC
 //!   reads collapse 389x, and checksums/NVMe writes READ this memory;
@@ -19,7 +22,9 @@
 //!
 //! Everything here must run on the engine thread with the CUDA context
 //! current (allocation, registration, and Drop) - the same contract every
-//! other device-adjacent resource in this crate already lives under.
+//! other device-adjacent resource in this crate already lives under. The
+//! one exception is the slab supply thread, which binds the context itself
+//! and only builds slabs (and drops any it could not hand over).
 
 use std::collections::BTreeMap;
 
@@ -62,25 +67,115 @@ pub enum PinMode {
 
 /// Write one byte per page so registration locks committed pages, not
 /// zero-page COW mappings - the probe measured register-of-touched at
-/// 5.9 ms/GiB and that is the contract we arm.
-fn touch_pages(buf: &mut [u8]) {
-    for i in (0..buf.len()).step_by(4096) {
-        // volatile so the write is not optimized away over a fresh zeroed Vec
-        // SAFETY: i < buf.len(); one-byte write inside the slice
-        unsafe { std::ptr::write_volatile(buf.as_mut_ptr().add(i), 0) };
+/// 5.9 ms/GiB and that is the contract we arm. The touch itself is the
+/// expensive half: ~200 ms per GiB of 4 KiB pages on GB10 when idle and
+/// ~1-1.5 s under serving load, ~19 ms on 2 MiB pages (see [`SlabMem`]).
+fn touch_pages(buf: &mut SlabMem) {
+    let (p, len) = (buf.as_mut_ptr(), buf.len());
+    for i in (0..len).step_by(4096) {
+        // volatile so the write is not optimized away over fresh zero pages
+        // SAFETY: i < len; one-byte write inside the mapping
+        unsafe { std::ptr::write_volatile(p.add(i), 0) };
+    }
+}
+
+/// A slab's bytes. On Linux an anonymous mapping advised onto transparent
+/// huge pages - faulting a GiB in 2 MiB pages instead of 4 KiB ones measured
+/// 19 ms vs 200 ms on GB10, and registering it 28 ms vs 56 ms. Distros ship
+/// THP as `madvise`, so without the advice every slab was the slow kind.
+/// Elsewhere, or if the mapping is refused, zeroed heap memory as before.
+enum SlabMem {
+    #[cfg(target_os = "linux")]
+    Mapped {
+        ptr: *mut u8,
+        len: usize,
+    },
+    Heap(Box<[u8]>),
+}
+
+// SAFETY: the mapping is owned exclusively by its slab; moving it between
+// threads (the supply thread builds slabs, the engine thread uses them)
+// moves ownership, never shares it.
+unsafe impl Send for SlabMem {}
+
+impl SlabMem {
+    fn new(len: usize) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: a fresh private anonymous mapping - no file, no fixed
+            // address; failure is checked before the pointer is used.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                // advice, not a contract: THP off or unavailable just leaves
+                // 4 KiB pages, which is what the heap path gets anyway
+                // SAFETY: p..p+len is the mapping created above.
+                let _ = unsafe { libc::madvise(p, len, libc::MADV_HUGEPAGE) };
+                return Self::Mapped { ptr: p.cast(), len };
+            }
+        }
+        Self::Heap(vec![0u8; len].into_boxed_slice())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Mapped { len, .. } => *len,
+            Self::Heap(b) => b.len(),
+        }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Mapped { ptr, .. } => *ptr,
+            Self::Heap(b) => b.as_ptr(),
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Mapped { ptr, .. } => *ptr,
+            Self::Heap(b) => b.as_mut_ptr(),
+        }
+    }
+}
+
+impl Drop for SlabMem {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Self::Mapped { ptr, len } = *self {
+            // SAFETY: the mapping created in `new`, unmapped exactly once;
+            // the slab unregistered it first (Slab's Drop runs before its
+            // fields drop).
+            unsafe { libc::munmap(ptr.cast(), len) };
+        }
     }
 }
 
 struct Slab {
-    mem: Box<[u8]>,
+    mem: SlabMem,
     registered: bool,
     /// Free ranges (offset, len), sorted by offset, coalesced on free.
     free: Vec<(u64, u64)>,
 }
 
+// SAFETY: see SlabMem - a slab is built on the supply thread and handed to
+// the engine thread whole; nothing else ever holds its pointer.
+unsafe impl Send for Slab {}
+
 impl Slab {
     fn new(bytes: u64, want_register: bool) -> (Self, bool) {
-        let mut mem = vec![0u8; bytes as usize].into_boxed_slice();
+        let mut mem = SlabMem::new(bytes as usize);
         let mut registered = false;
         if want_register {
             touch_pages(&mut mem);
@@ -157,8 +252,9 @@ impl Slab {
 impl Drop for Slab {
     fn drop(&mut self) {
         if self.registered {
-            // SAFETY: registered exactly once on this pointer; engine-thread
-            // drop contract (context current). Failure is unrecoverable and
+            // SAFETY: registered exactly once on this pointer; dropped on the
+            // engine thread, or on the supply thread that built it (both
+            // have the context current). Failure is unrecoverable and
             // harmless at teardown - the process is releasing everything.
             let _ =
                 unsafe { cudarc::driver::sys::cuMemHostUnregister(self.mem.as_mut_ptr().cast()) };
@@ -181,9 +277,102 @@ struct AllocInfo {
     payload: u64,
 }
 
-/// T1 capacity: lazily-grown, register-once slabs with a coalescing
-/// range allocator. Hands out [`Loc`]s the catalog round-trips; the transport
-/// resolves them back to pointers for DMA/checksum.
+/// Builds a store's remaining slabs on its own thread, right after the
+/// tier arms, and hands each over whole.
+///
+/// A slab used to be built inside `alloc`, i.e. on the engine thread in the
+/// middle of a tier pump: touching and registering a GiB stalled serving
+/// ~0.9-1.6 s on GB10 under load, once per GiB of tier growth - and Qwen3.8
+/// writes ~0.5 GiB of checkpoint state per agent request, so a filling tier
+/// took a stream down to a fraction of its speed (seen in the field: 10-14
+/// tok/s instead of 40-60, the GPU idling in one-second beats). The budget is
+/// a page-locked commitment the manager already prices in full
+/// (`hostmem.rs`), so building all of it up front changes no plan; it
+/// moves the cost off the serving thread and lands it before the traffic
+/// does. This is also where vLLM's and SGLang's host KV pools allocate:
+/// once, at start.
+struct SlabSupply {
+    rx: std::sync::mpsc::Receiver<Slab>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// The thread has delivered its last slab (or gave up).
+    done: bool,
+}
+
+impl SlabSupply {
+    /// `sizes` in build order; `ctx` is bound on the thread so
+    /// registration has a context (None = unregistered slabs).
+    fn start(
+        sizes: Vec<u64>,
+        register: bool,
+        ctx: Option<std::sync::Arc<cudarc::driver::CudaContext>>,
+    ) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let halt = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("kv-tier-slabs".into())
+            .spawn(move || {
+                let mut register = register;
+                if register && ctx.as_ref().is_some_and(|c| c.bind_to_thread().is_err()) {
+                    tracing::warn!(
+                        "KV tier slab supply could not bind the CUDA context - \
+                         the rest of the tier serves PAGEABLE"
+                    );
+                    register = false;
+                }
+                let t0 = std::time::Instant::now();
+                let (mut built, mut bytes, mut pinned) = (0usize, 0u64, 0usize);
+                for len in sizes {
+                    if halt.load(Relaxed) {
+                        break;
+                    }
+                    let (slab, ok) = Slab::new(len, register);
+                    // one refusal says the OS is short on lockable pages:
+                    // stop asking, the same latch `alloc` keeps
+                    register &= ok;
+                    pinned += ok as usize;
+                    if tx.send(slab).is_err() {
+                        break; // the store is gone; this slab drops here
+                    }
+                    built += 1;
+                    bytes += len;
+                }
+                tracing::info!(
+                    slabs = built,
+                    gib = bytes as f64 / (1u64 << 30) as f64,
+                    pinned,
+                    ms = t0.elapsed().as_millis() as u64,
+                    "KV tier RAM slabs ready"
+                );
+            })
+            .ok();
+        Self {
+            rx,
+            stop,
+            done: thread.is_none(),
+            thread,
+        }
+    }
+}
+
+impl Drop for SlabSupply {
+    fn drop(&mut self) {
+        // let the thread finish the slab in hand, then the channel's
+        // undelivered ones drop here with `rx` (engine thread, context
+        // current)
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// T1 capacity: register-once slabs with a coalescing range allocator,
+/// built up front by a `SlabSupply` (lazily in `alloc` when there is none,
+/// as in the unit tests). Hands out [`Loc`]s the catalog round-trips; the
+/// transport resolves them back to pointers for DMA/checksum.
 ///
 /// Capacity accounting note: the CATALOG's byte ledger admits exact sealed
 /// bytes; this store rounds each extent up to [`ALLOC_ALIGN`] and slabs are
@@ -193,6 +382,9 @@ struct AllocInfo {
 /// reservation and serving recomputes - never a wedge, never silent (the
 /// failure counts in `Counters::io_failures` and logs).
 pub struct HostStore {
+    /// Declared first on purpose: fields drop in order, and the supply's
+    /// thread must be joined before the slabs it may still be handing over.
+    supply: Option<SlabSupply>,
     slabs: Vec<Slab>,
     /// Total budget in bytes - slabs never grow past it.
     capacity: u64,
@@ -217,6 +409,7 @@ impl HostStore {
     /// The elected page-lock path (false only in unit tests without a GPU).
     pub fn new(capacity: u64, register: bool) -> Self {
         Self {
+            supply: None,
             slabs: Vec::new(),
             capacity,
             slab_bytes: DEFAULT_SLAB_BYTES.min(capacity.max(ALLOC_ALIGN)),
@@ -230,6 +423,67 @@ impl HostStore {
             next_loc: 0,
             allocated: 0,
         }
+    }
+
+    /// Build the rest of the budget now, off this thread (see
+    /// `SlabSupply`); `ctx` lets the supply thread register. Call once,
+    /// after the first slab proved the transfer path (the transport's
+    /// self-test) - from here `alloc` never builds a slab itself.
+    pub fn start_supply(&mut self, ctx: Option<std::sync::Arc<cudarc::driver::CudaContext>>) {
+        if self.supply.is_some() {
+            return;
+        }
+        let mut room = self
+            .capacity
+            .saturating_sub(self.slabs.iter().map(|s| s.mem.len() as u64).sum());
+        let mut sizes = Vec::new();
+        while room >= ALLOC_ALIGN {
+            let len = self.slab_bytes.min(room);
+            sizes.push(len);
+            room -= len;
+        }
+        if sizes.is_empty() {
+            return; // the first slab was the whole budget
+        }
+        self.supply = Some(SlabSupply::start(sizes, self.try_register, ctx));
+    }
+
+    /// Take the slabs the supply has finished so far.
+    fn adopt_supplied(&mut self) {
+        let Some(sup) = self.supply.as_mut() else {
+            return;
+        };
+        if sup.done {
+            return;
+        }
+        loop {
+            match sup.rx.try_recv() {
+                Ok(slab) => {
+                    if self.try_register && !slab.registered {
+                        self.try_register = false;
+                        self.mode = PinMode::Pageable;
+                    }
+                    self.slabs.push(slab);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    sup.done = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The supply has delivered everything it will (or there is none).
+    pub fn supply_done(&mut self) -> bool {
+        self.adopt_supplied();
+        self.supply.as_ref().is_none_or(|s| s.done)
+    }
+
+    /// Slabs carved so far, and how many of them are page-locked.
+    pub fn slab_counts(&self) -> (usize, usize) {
+        let pinned = self.slabs.iter().filter(|s| s.registered).count();
+        (self.slabs.len(), pinned)
     }
 
     /// The transfer mode transfers should assume right now. Registered until
@@ -253,11 +507,22 @@ impl HostStore {
     /// the store charges; the payload length is what `resolve` reports back.
     pub fn alloc(&mut self, payload: u64) -> Result<Loc, HostMemError> {
         let rounded = self.rounded(payload);
+        self.adopt_supplied();
         // try existing slabs first
         for (si, slab) in self.slabs.iter_mut().enumerate() {
             if let Some(off) = slab.alloc(rounded) {
                 return Ok(self.record(si, off, rounded, payload));
             }
+        }
+        if self.supply.as_ref().is_some_and(|s| !s.done) {
+            // the rest of the budget is still being built off-thread: no
+            // room YET, which the transport completes as NoRoom - building
+            // the slab here is exactly the serving stall the supply exists
+            // to remove
+            return Err(HostMemError::Exhausted {
+                wanted: payload,
+                free: self.capacity.saturating_sub(self.allocated),
+            });
         }
         // grow: a new slab, budget permitting. The last slab may be smaller
         // than the stride so a budget that is not a slab multiple is still
@@ -314,6 +579,9 @@ impl HostStore {
     /// each rounded extent CONTIGUOUS inside one slab, so a ledger with room
     /// can still sit on an arena whose free bytes are holes too small for the
     /// next extent. Eviction asks this, not the ledger, when it is done.
+    /// Budget a running `SlabSupply` has not delivered yet counts as
+    /// growth: eviction must never cut holes for capacity that is on its
+    /// way (`alloc` answers no-room for those few seconds instead).
     pub fn fits(&self, payloads: &[u64]) -> bool {
         let mut free: Vec<Vec<(u64, u64)>> = self.slabs.iter().map(|s| s.free.clone()).collect();
         let mut used: u64 = self.slabs.iter().map(|s| s.mem.len() as u64).sum();
@@ -601,6 +869,41 @@ mod tests {
         let b = s.alloc(1 << 19).unwrap(); // fits only in a remainder slab
         s.free(a).unwrap();
         s.free(b).unwrap();
+    }
+
+    #[test]
+    fn the_supply_builds_the_rest_of_the_budget_off_thread() {
+        let mut s = HostStore::new(4 << 20, false);
+        s.slab_bytes = 1 << 20;
+        // the first slab comes the old way (the transport's self-test)
+        let a = s.alloc(1 << 20).unwrap();
+        s.start_supply(None);
+        let t0 = std::time::Instant::now();
+        while !s.supply_done() {
+            assert!(t0.elapsed().as_secs() < 30, "supply never finished");
+            std::thread::yield_now();
+        }
+        assert_eq!(s.slabs.len(), 4);
+        let rest: Vec<Loc> = (0..3).map(|_| s.alloc(1 << 20).unwrap()).collect();
+        assert!(matches!(
+            s.alloc(1 << 20),
+            Err(HostMemError::Exhausted { .. })
+        ));
+        assert!(!s.fits(&[1 << 20]));
+        s.free(a).unwrap();
+        for l in rest {
+            s.free(l).unwrap();
+        }
+        assert_eq!(s.allocated(), 0);
+    }
+
+    #[test]
+    fn a_store_dropped_mid_supply_joins_its_thread() {
+        let mut s = HostStore::new(256 << 20, false);
+        s.slab_bytes = 1 << 20;
+        let _ = s.alloc(1 << 20).unwrap();
+        s.start_supply(None);
+        drop(s); // must neither hang nor leak the slabs still in the channel
     }
 
     #[test]

@@ -210,6 +210,38 @@ fn poll_until(t: &mut RamTransport, n: usize) -> Vec<paddock_engine::kv_tier::Io
 }
 
 #[test]
+fn t1_slabs_past_the_first_build_off_thread_and_register() {
+    // The budget past the self-test's slab builds on the supply thread
+    // (host.rs `SlabSupply`) - never inside a serving tick, where one GiB
+    // stalled the engine ~1 s. The thread binds the context itself, so its
+    // slabs must come back page-locked exactly like the first.
+    let Some(exec) = common::gpu() else { return };
+    if !exec.has_kv_tier_xfer() {
+        common::missing("pack has no kv tier gather/scatter (slots 479/480) - rebuild it");
+        return;
+    }
+    let mut transport = RamTransport::new(&exec, 3 << 30).expect("transport");
+    let first_pinned = transport.t1_slabs().2 == 1;
+    let t0 = std::time::Instant::now();
+    let (n, pinned) = loop {
+        let (done, n, pinned) = transport.t1_slabs();
+        if done {
+            break (n, pinned);
+        }
+        assert!(t0.elapsed().as_secs() < 120, "slab supply never finished");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    eprintln!(
+        "kv tier T1: {n} slabs, {pinned} pinned, carved in {} ms",
+        t0.elapsed().as_millis()
+    );
+    assert_eq!(n, 3, "the whole 3 GiB budget is carved");
+    if first_pinned {
+        assert_eq!(pinned, 3, "the supply's slabs register like the first");
+    }
+}
+
+#[test]
 fn catalog_ram_transport_roundtrip_is_byte_exact() {
     let Some(exec) = common::gpu() else { return };
     if !exec.has_kv_tier_xfer() {

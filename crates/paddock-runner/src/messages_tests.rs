@@ -1,5 +1,80 @@
 use super::*;
 
+/// CPU-only reconstruction of a captured benchmark's actual Anthropic adapter.
+/// Counts must agree with the server before prefix-overlap conclusions are used.
+#[test]
+#[ignore = "requires PADDOCK_ANTHROPIC_CAPTURE and PADDOCK_TEMPLATE_MODEL"]
+fn captured_anthropic_prefix_boundaries() {
+    let model = std::path::PathBuf::from(std::env::var("PADDOCK_TEMPLATE_MODEL").unwrap());
+    let capture = std::env::var("PADDOCK_ANTHROPIC_CAPTURE").unwrap();
+    let tokenizer = paddock_tokenizer::GgufTokenizer::from_hf_dir(&model).unwrap();
+    let template = std::fs::read_to_string(model.join("chat_template.jinja")).unwrap();
+    let rows: Vec<Value> =
+        serde_json::from_str(&std::fs::read_to_string(capture).unwrap()).unwrap();
+    let mut previous: Vec<u32> = Vec::new();
+    for (i, row) in rows
+        .iter()
+        .filter(|r| r["path"] == "/v1/messages")
+        .enumerate()
+    {
+        let body = &row["effective"];
+        let messages = convert_messages(
+            body.get("system"),
+            body["messages"].as_array().unwrap(),
+            crate::chat_template::renders_late_system(&template),
+            false,
+        )
+        .unwrap();
+        let tools = body
+            .get("tools")
+            .map(|t| convert_tools(t.as_array().unwrap()).unwrap());
+        let rendered = crate::chat_template::render(
+            &template,
+            &crate::chat_template::normalize_messages(&messages),
+            tools.as_deref(),
+            Some(&json!({"enable_thinking": false})),
+        )
+        .unwrap();
+        let ids = tokenizer.encode(&rendered).unwrap();
+        let usage = row["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|e| e["event"]["type"] == "message_delta")
+            .unwrap()["event"]["usage"]
+            .clone();
+        let recorded: u64 = [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .iter()
+        .map(|k| usage[k].as_u64().unwrap_or(0))
+        .sum();
+        assert_eq!(
+            ids.len() as u64,
+            recorded,
+            "offline token count, request {i}"
+        );
+        let common = previous
+            .iter()
+            .zip(&ids)
+            .take_while(|(a, b)| a == b)
+            .count();
+        println!(
+            "ANTHROPIC_PREFIX {}",
+            json!({"request": i, "tokens": ids.len(),
+            "cached": usage["cache_read_input_tokens"], "previous": previous.len(), "common": common,
+            "old_cut_ids": &previous[common.saturating_sub(2)..previous.len().min(common+3)],
+            "new_cut_ids": &ids[common.saturating_sub(2)..ids.len().min(common+3)],
+            "old_cut": tokenizer.decode(&previous[common.saturating_sub(5)..previous.len().min(common+20)], false).unwrap(),
+            "new_cut": tokenizer.decode(&ids[common.saturating_sub(5)..ids.len().min(common+20)], false).unwrap()})
+        );
+        previous = ids;
+    }
+}
+
 #[test]
 fn system_blocks_preserve_instruction_boundaries() {
     let system = json!([
@@ -774,16 +849,16 @@ fn the_compact_edit_is_stripped_after_round_zero() {
         {"type": "compact_20260112", "trigger": {"type": "input_tokens", "value": 800}},
         {"type": "clear_tool_uses_20250919"},
     ]}));
-    drop_compact_edit(&mut cm);
+    compact::drop_compact_edit(&mut cm);
     let edits = cm.as_ref().unwrap()["edits"].as_array().unwrap();
     assert_eq!(edits.len(), 2);
     assert_eq!(edits[0]["type"], "clear_thinking_20251015");
     assert_eq!(edits[1]["type"], "clear_tool_uses_20250919");
     // idempotent, and a config without one is untouched
-    drop_compact_edit(&mut cm);
+    compact::drop_compact_edit(&mut cm);
     assert_eq!(cm.as_ref().unwrap()["edits"].as_array().unwrap().len(), 2);
     let mut none: Option<Value> = None;
-    drop_compact_edit(&mut none);
+    compact::drop_compact_edit(&mut none);
     assert!(none.is_none());
 }
 

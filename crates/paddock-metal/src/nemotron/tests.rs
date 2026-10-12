@@ -478,10 +478,7 @@ fn elected_checkpoint_lifecycle() {
     assert!(m.prefill(0, &[VOCAB as u32]).is_err());
     m.release_inactive_slots(&[]);
     while m.evict_prefix() {}
-    assert_eq!(
-        m.pool.free_blocks(),
-        m.page_stride * (4 + PREFIX_PER_SLOT * 4)
-    );
+    assert_eq!(m.pool.free_blocks(), m.pool.capacity() as usize);
     assert_eq!(m.device.allocated_bytes(), used);
     m.reset();
     let first = m.forward(17).unwrap();
