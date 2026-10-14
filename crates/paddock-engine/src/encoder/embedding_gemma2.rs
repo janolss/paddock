@@ -9,8 +9,12 @@ pub const EOI_TOKEN: u32 = 258882;
 pub const EOA_TOKEN: u32 = 258883;
 /// `<|video|>`: a video frame's soft token, distinct from a still image.
 pub const VIDEO_TOKEN: u32 = 258884;
-/// Upstream video processor defaults, independent of the still-image budget.
-pub const VIDEO_FRAME_TOKENS: usize = 70;
+/// A video frame's soft-token budget, independent of the still-image one:
+/// the checkpoint's own `video_processor.max_soft_tokens` (140 in Google's
+/// `processor_config.json` and in the MLX package's). The processor CLASS
+/// defaults to 70, which is what this used to read - frames then took half
+/// the checkpoint's resolution.
+pub const VIDEO_FRAME_TOKENS: usize = 140;
 pub const MAX_VIDEO_FRAMES: usize = 32;
 /// `<|image>`: opens a picture.
 pub const BOI_TOKEN: u32 = 255999;

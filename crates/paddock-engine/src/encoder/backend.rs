@@ -136,7 +136,12 @@ impl EncoderBackend for crate::gpu_model::embedding_gemma2::GpuEmbeddingGemma2 {
         self.burst_windows()
     }
     fn media_kinds(&self) -> (bool, bool, bool) {
-        (self.serves_images(), self.serves_audio(), false)
+        // video frames ride the picture tower at the frame budget
+        (
+            self.serves_images(),
+            self.serves_audio(),
+            self.serves_images(),
+        )
     }
     fn weights_mem_bytes(&self) -> Option<u64> {
         self.weights_mem_bytes()

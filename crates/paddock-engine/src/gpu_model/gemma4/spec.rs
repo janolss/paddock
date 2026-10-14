@@ -1358,6 +1358,94 @@ impl GpuGemma4 {
         Ok(plan.fetched)
     }
 
+    /// Sampled-spec phase 1 - the round a constrained slot rides (every
+    /// tool-carrying request: its grammar samples each verify row on the
+    /// host, accepting while the pick matches the draft). The ragged verify
+    /// tick of [`Self::forward_spec_rows_impl`] with every row a host row,
+    /// its raw logits returned in request order. Positions are service-owned
+    /// and KV is position-keyed, so a rejected row needs no rollback;
+    /// [`Self::spec_commit_impl`] only re-points the drafter's h at each
+    /// slot's last committed row. Declines with DFlash attached (its feature
+    /// ring commits from the round's picks, which only the service holds
+    /// here) and on the device round's own bounds.
+    pub(crate) fn forward_spec_verify_impl(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Option<Vec<f32>>, GpuError> {
+        assert!(
+            self.spec_host_round.is_none(),
+            "unclosed sampled spec round"
+        );
+        if reqs.is_empty()
+            || self.dflash.is_some()
+            || self.spec_async.is_some()
+            || reqs.len() > spec_live_max().min(self.n_slots)
+        {
+            return Ok(None);
+        }
+        let vocab = self.hp.n_vocab;
+        let cap_rows = self
+            .batch_logits
+            .as_ref()
+            .map(|b| b.len() / vocab)
+            .unwrap_or(0);
+        let r: usize = reqs.iter().map(|(_, _, c)| c.len()).sum();
+        if r == 0 || r > cap_rows || r > super::forward::PF_ROWS {
+            return Ok(None);
+        }
+        let mut tokens = Vec::with_capacity(r);
+        let mut positions = Vec::with_capacity(r);
+        let mut slots = Vec::with_capacity(r);
+        let mut layout = Vec::with_capacity(reqs.len());
+        for (slot, start, chunk) in reqs {
+            if *slot >= self.n_slots || chunk.is_empty() || start + chunk.len() > self.max_ctx {
+                return Ok(None);
+            }
+            layout.push((*slot, *start, tokens.len()));
+            for (i, &t) in chunk.iter().enumerate() {
+                tokens.push(t);
+                positions.push((start + i) as u32);
+                slots.push(*slot as u32);
+            }
+        }
+        let plans = vec![crate::generator::RowSample::Host; r];
+        self.scratch.moe_verify = true;
+        let step = self.forward_batch_sampled_rows(&tokens, &positions, &slots, &plans);
+        self.scratch.moe_verify = false;
+        let step = step?;
+        if step.host_rows.len() != r {
+            return Err(GpuError::Driver(format!(
+                "sampled spec verify: {} host rows for {r} rows",
+                step.host_rows.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(r * vocab);
+        for (_, row) in step.host_rows {
+            out.extend_from_slice(&row);
+        }
+        self.spec_host_round = Some((layout, r));
+        Ok(Some(out))
+    }
+
+    /// Sampled-spec phase 2: request i of the open round committed
+    /// `committed[i]` rows (its accepted drafts plus the pending token), so
+    /// its last committed row's hidden is what the drafter chains from next.
+    pub(crate) fn spec_commit_impl(&mut self, committed: &[u32]) {
+        let (layout, rows) = self
+            .spec_host_round
+            .take()
+            .expect("no open sampled spec round");
+        assert_eq!(committed.len(), layout.len());
+        let mut total = 0usize;
+        for (&(slot, start, base), &c) in layout.iter().zip(committed) {
+            let a = (c as usize).max(1) - 1;
+            self.spec_rows[slot] = Some(((start + a) as u32, (base + a) as u32));
+            self.spec_stats.bump_depth(a + 1);
+            total += c as usize;
+        }
+        self.spec_stats.bump(layout.len(), rows, total);
+    }
+
     /// Spec verify through the standard sampled decode tick: rows = per-slot
     /// [pending, drafts...] at consecutive positions. Positions are service-
     /// owned, so rejected rows need no rollback - their KV entries sit
@@ -1578,7 +1666,9 @@ impl GpuGemma4 {
             self.ids_skip = true;
         }
         self.dflash_defer = self.dflash.is_some();
+        self.scratch.moe_verify = true;
         let step = self.forward_batch_sampled_rows(&tokens, &positions, &slots, &padded_plans);
+        self.scratch.moe_verify = false;
         self.ids_skip = false;
         self.dflash_defer = false;
         let verify_ms = t_verify.elapsed().as_secs_f64() * 1e3;
@@ -1787,11 +1877,13 @@ impl GpuGemma4 {
                         n,
                         rr: plan.rr,
                         k_use: plan.k_use,
+                        // captured as a verify tick (Scratch::moe_verify)
                         gkey: (
                             r,
                             k1,
                             gkey_long,
                             gkey_shallow,
+                            true,
                             super::batch::kv_split_band(self.attn_pos_max),
                         ),
                     });

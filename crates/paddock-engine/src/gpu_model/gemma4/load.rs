@@ -4,8 +4,8 @@
 //! the real 31B GGUF) and llama.cpp b10058 `load_arch_hparams` /
 //! `load_arch_tensors`. Projection weights are repacked Q8_0 (RepackedQ8 -
 //! `q8_0_gemv_repacked` at decode, `q8_0_gemm_repacked` at prefill, bit-equal
-//! pair at batch 1); the tied token_embd stays raw Q8_0 for `dequant_slice`
-//! row gathers + the head GEMV. Norms/scales are f32.
+//! pair at batch 1); the tied token_embd is repacked once and serves both
+//! the head and the row gathers (planes::EmbdTable). Norms/scales are f32.
 
 use std::sync::Arc;
 
@@ -903,27 +903,35 @@ impl GpuGemma4 {
         let ffn_plane = |name: &str, pad_out: bool| -> Result<Plane, LoadError> {
             ffn_plane(&exec, map, name, pad_out, ffn_align)
         };
-        // The raw embedding table for row gathers. A k-quant embedding keeps
-        // no raw copy: its repacked head is the table (planes::EmbdTable).
         let embd_info = map
             .tensor_info("token_embd.weight")
             .ok_or_else(|| LoadError::Tensor("token_embd.weight".into(), "missing".into()))?;
         let n_vocab = embd_info.dims[1] as usize;
-        let token_embd = match plane_class(embd_info.ggml_type) {
-            Some(PlaneClass::Kq) => None,
-            _ => Some(exec.upload_raw(map, "token_embd.weight")?),
-        };
         // The LM head. gemma4 TIES it to the embedding (no `output.weight` in
         // the file, so the repacked embedding doubles as the head); muse-glimmer
         // does not (config tie_word_embeddings=false, and `output.weight` is a
         // real 6656x202048 bf16 plane). Tying them there would be a quiet
         // accuracy bug, so the tensor decides, never the arch - and the plane
         // carries its own class, so a bf16 head serves as bf16.
-        let head = match map.tensor_bytes("output.weight") {
-            Ok(_) => plane("output.weight")?,
-            Err(_) => plane("token_embd.weight")?,
+        let tied = map.tensor_bytes("output.weight").is_err();
+        let head = if tied {
+            plane("token_embd.weight")?
+        } else {
+            plane("output.weight")?
         };
-        if token_embd.is_none() && head.kq().is_none() {
+        // The raw embedding table for row gathers, only where the head cannot
+        // serve them (planes::EmbdTable): beside an untied head, or a tied
+        // Q8_0 head on a pack without slot 832. A tied file used to keep the
+        // raw Q8_0 copy beside its repacked head - the same matrix twice, 1.5 GB
+        // on the 31B. The diffusion lane transposes the raw rows once at load;
+        // that copy drops once the lane is built (below).
+        let q8r = tied && head.q8().is_some() && exec.has_embed_gather_q8r();
+        let mut token_embd = if !tied || (head.q8().is_some() && !q8r) || arch.is_diffusion() {
+            Some(exec.upload_raw(map, "token_embd.weight")?)
+        } else {
+            None
+        };
+        if !tied && matches!(plane_class(embd_info.ggml_type), Some(PlaneClass::Kq)) {
             // an UNTIED head over a k-quant embedding: the gathers would
             // need a second repacked table; no file ships the pairing today
             return Err(LoadError::Tensor(
@@ -2987,6 +2995,11 @@ impl GpuGemma4 {
         } else {
             None
         };
+        // the lane holds its own transposed copy; the gathers read the head
+        let mut weights_bytes = weights_bytes;
+        if q8r && let Some(raw) = token_embd.take() {
+            weights_bytes = weights_bytes.map(|b| b.saturating_sub(raw.bytes.len() as u64));
+        }
         Ok(Self {
             hp: Hparams {
                 arch,
@@ -3075,6 +3088,7 @@ impl GpuGemma4 {
             dflash_defer: false,
             dflash_fuse_wanted: true,
             spec_rows: Vec::new(),
+            spec_host_round: None,
             mix_inflight: None,
             mix_fallback: None,
             spec_stats: Default::default(),

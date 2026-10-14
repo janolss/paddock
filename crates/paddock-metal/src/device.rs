@@ -948,9 +948,13 @@ impl MetalDevice {
             "mlx_rms_selected",
             "mlx_residual",
             "mlx_swiglu",
+            "mlx_swiglu_precise",
+            "mlx_attn_gate_precise",
             "mlx_dn_conv",
+            "mlx_dn_conv_precise",
             "mlx_dn_qk_norm",
             "mlx_dn_gates",
+            "mlx_dn_gates_precise",
             "mlx_dn_recurrent",
             "mlx_dn_recurrent_quad",
             "mlx_dn_recurrent_packed",
@@ -959,6 +963,8 @@ impl MetalDevice {
             "mlx_dn_gated_norm",
             "mlx_qnorm_rope",
             "mlx_knorm_store",
+            "mlx_qnorm_rope_contiguous",
+            "mlx_knorm_store_contiguous",
             "mlx_attn_gate",
             "mlx_attention_query",
             "mlx_attention_decode",
@@ -2546,6 +2552,14 @@ mod tests {
                     .is_none()
                 );
             }
+        }
+        for name in ["mlx_qnorm_rope", "mlx_knorm_store"] {
+            assert!(lib.newFunctionWithName(&NSString::from_str(name)).is_some());
+            assert!(
+                lib.newFunctionWithName(&NSString::from_str(&format!("{name}_contiguous")))
+                    .is_some(),
+                "qualified LightOn arithmetic must exist in the shipping library"
+            );
         }
     }
 

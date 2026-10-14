@@ -3,6 +3,17 @@ use super::*;
 #[cfg(test)]
 thread_local! {
     pub(super) static BASELINE_RECURRENT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static PRECISE_RECURRENT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static BASELINE_LIGHTON_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The tied 4B affine graph is qualified as one arithmetic contract. Keep
+/// unrelated checkpoints and pre-M5 devices on their existing paths.
+pub(super) fn lighton_reference_math(g: Geometry, tied: bool, device: &MetalDevice) -> bool {
+    let enabled = g == Geometry::DENSE_4B && tied && device.tensor_accelerated();
+    #[cfg(test)]
+    let enabled = enabled && !BASELINE_LIGHTON_FOR_TEST.get();
+    enabled
 }
 
 /// A validated, immutable row plan. GPU metadata is re-uploaded on resumption:
@@ -22,6 +33,18 @@ pub(super) struct Plan {
 }
 
 impl Qwen35 {
+    pub(super) fn lighton_reference_math(&self) -> bool {
+        self.mlx && lighton_reference_math(self.geometry, self.head.is_none(), &self.device)
+    }
+    pub(super) fn precise_recurrent_arithmetic(&self) -> bool {
+        let enabled = self.lighton_reference_math();
+        #[cfg(test)]
+        let enabled = enabled
+            || (self.mlx
+                && self.geometry == Geometry::DENSE_4B
+                && PRECISE_RECURRENT_FOR_TEST.get());
+        enabled
+    }
     /// M5 packed prompt contractions have their own qualified arithmetic.
     /// Cached suffixes remain prompt work, even if only one row is left;
     /// independently decoding requests never inherit that role from peers.
@@ -558,7 +581,9 @@ impl Qwen35 {
                         );
                     }
                     cmd.dispatch(
-                        if self.mlx && self.bonsai.is_none() {
+                        if self.precise_recurrent_arithmetic() {
+                            "mlx_dn_conv_precise"
+                        } else if self.mlx && self.bonsai.is_none() {
                             "mlx_dn_conv"
                         } else {
                             "dn_conv"
@@ -589,7 +614,9 @@ impl Qwen35 {
                         32,
                     );
                     cmd.dispatch(
-                        if self.mlx && self.bonsai.is_none() {
+                        if self.precise_recurrent_arithmetic() {
+                            "mlx_dn_gates_precise"
+                        } else if self.mlx && self.bonsai.is_none() {
                             "mlx_dn_gates"
                         } else {
                             "dn_gates"
@@ -829,7 +856,9 @@ impl Qwen35 {
                         &s.gemm,
                     );
                     cmd.dispatch(
-                        if self.mlx && self.bonsai.is_none() {
+                        if self.precise_recurrent_arithmetic() {
+                            "mlx_swiglu_precise"
+                        } else if self.mlx && self.bonsai.is_none() {
                             "mlx_swiglu"
                         } else {
                             "swiglu"

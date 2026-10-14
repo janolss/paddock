@@ -995,6 +995,11 @@ pub fn oa_part_next(last: bool, keeps_tail: bool) -> String {
              above except the user's own messages - include what remains open."
         }
     };
+    part_next_with(end)
+}
+
+/// The later-part instruction around its closing sentence (both dialects).
+fn part_next_with(end: &str) -> String {
     format!(
         "The conversation is being compacted in parts. The first message above \
          holds the user's own messages and the summary of everything before this \
@@ -1154,6 +1159,228 @@ pub fn oa_span_parts(
         parts.push(cur);
     }
     parts
+}
+
+// -- Summarization in parts, /v1/messages shape ------------------------------
+//
+// The same rolling pass over a /v1/messages span. A parallel tool round is
+// ONE user message there (every tool_result of the round in its content),
+// so the cuts fall between content blocks, not only between messages: a
+// part holds whole non-user messages and runs of user blocks, and a part
+// that shows a tool_result whose tool_use sits in an earlier part re-carries
+// that call in an assistant message just before the results.
+
+/// The later-part instruction for /v1/messages: only the pending turn (and
+/// the tool round-trips under it) survives the compaction raw.
+pub fn anth_part_next(last: bool) -> String {
+    part_next_with(if last {
+        "This is the LAST part: your reply replaces the whole conversation \
+         above; only the current request and the tool calls made for it stay \
+         as they are - include precisely what remains open."
+    } else {
+        "More parts follow after this one."
+    })
+}
+
+fn anth_role(m: &Value) -> &str {
+    m.get("role").and_then(Value::as_str).unwrap_or("")
+}
+
+fn block_type(b: &Value) -> &str {
+    b.get("type").and_then(Value::as_str).unwrap_or("")
+}
+
+/// A message's content blocks (string content is one text block).
+fn anth_blocks(m: &Value) -> Vec<Value> {
+    match m.get("content") {
+        Some(Value::String(s)) => vec![json!({"type": "text", "text": s})],
+        Some(Value::Array(b)) => b.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// A /v1/messages message cut down so about `keep` of its text remains:
+/// text, thinking and tool-result text lose their middle, a tool_use input
+/// its long strings (it stays an object); pictures and short fields stay.
+pub fn anth_elide(m: &Value, keep: f64) -> Value {
+    let floor = 256;
+    let cut = |s: &mut String| {
+        if s.chars().count() > floor {
+            *s = oa_elide_str(s, keep);
+        }
+    };
+    let mut m = m.clone();
+    match m.get_mut("content") {
+        Some(Value::String(s)) => cut(s),
+        Some(Value::Array(blocks)) => {
+            for b in blocks.iter_mut() {
+                for key in ["text", "thinking"] {
+                    if let Some(Value::String(s)) = b.get_mut(key) {
+                        cut(s);
+                    }
+                }
+                match b.get_mut("content") {
+                    Some(Value::String(s)) => cut(s),
+                    Some(Value::Array(parts)) => {
+                        for p in parts.iter_mut() {
+                            if let Some(Value::String(s)) = p.get_mut("text") {
+                                cut(s);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(input) = b.get_mut("input") {
+                    oa_elide_json(input, keep, floor);
+                }
+            }
+        }
+        _ => {}
+    }
+    m
+}
+
+/// Consecutive user (or assistant) units as one message.
+fn anth_merge(units: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for u in units {
+        let role = anth_role(&u);
+        match out.last_mut() {
+            Some(last) if matches!(role, "user" | "assistant") && anth_role(last) == role => {
+                let mut blocks = anth_blocks(last);
+                blocks.extend(anth_blocks(&u));
+                last["content"] = Value::Array(blocks);
+            }
+            _ => out.push(u),
+        }
+    }
+    out
+}
+
+/// Cut a /v1/messages `span` into consecutive parts (each a list of
+/// messages) whose `cost` - a message's estimated tokens - fits `budget`.
+/// The units are whole messages, and single content blocks of a user
+/// message that alone outgrows the budget; the user units of a run ride one
+/// user message. A part that shows a
+/// tool_result whose tool_use is not in it re-carries the call; a unit that
+/// alone outgrows the budget is elided to fit. One part, the span itself,
+/// when it already fits.
+pub fn anth_span_parts(
+    span: &[Value],
+    cost: &dyn Fn(&Value) -> usize,
+    budget: usize,
+) -> Vec<Vec<Value>> {
+    let budget = budget.max(1);
+    if span.iter().map(cost).sum::<usize>() <= budget {
+        return vec![span.to_vec()];
+    }
+    // a message stays whole (untouched, so part 1 stays the live prefix)
+    // unless it alone outgrows a part
+    let units = span.iter().flat_map(|m| {
+        if anth_role(m) == "user" && cost(m) > budget {
+            anth_blocks(m)
+                .into_iter()
+                .map(|b| json!({"role": "user", "content": [b]}))
+                .collect()
+        } else {
+            vec![m.clone()]
+        }
+    });
+    let calls_in = |u: &Value| -> Vec<Value> {
+        if anth_role(u) != "assistant" {
+            return Vec::new();
+        }
+        anth_blocks(u)
+            .into_iter()
+            .filter(|b| block_type(b) == "tool_use")
+            .collect()
+    };
+    let mut parts: Vec<Vec<Value>> = Vec::new();
+    let mut cur: Vec<Value> = Vec::new();
+    let mut used = 0usize;
+    let mut calls: std::collections::HashMap<String, Value> = Default::default();
+    for u in units {
+        let mut u = u;
+        let mut c = cost(&u);
+        if c > budget {
+            // room left for a re-carried call beside it
+            u = anth_elide(&u, budget as f64 * 0.85 / c as f64);
+            c = cost(&u);
+        }
+        if used + c > budget && !cur.is_empty() {
+            parts.push(anth_merge(std::mem::take(&mut cur)));
+            used = 0;
+        }
+        for call in calls_in(&u) {
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                calls.insert(id.to_owned(), call.clone());
+            }
+        }
+        if anth_role(&u) == "user" {
+            for b in anth_blocks(&u) {
+                if block_type(&b) != "tool_result" {
+                    continue;
+                }
+                let id = b.get("tool_use_id").and_then(Value::as_str);
+                let shown = cur
+                    .iter()
+                    .flat_map(calls_in)
+                    .any(|x| x.get("id").and_then(Value::as_str) == id);
+                if !shown && let Some(call) = id.and_then(|i| calls.get(i)) {
+                    // before the run of user blocks it joins
+                    let at = cur
+                        .iter()
+                        .rposition(|x| anth_role(x) != "user")
+                        .map_or(0, |p| p + 1);
+                    let carry = json!({"role": "assistant", "content": [call.clone()]});
+                    used += cost(&carry);
+                    cur.insert(at, carry);
+                }
+            }
+        }
+        used += c;
+        cur.push(u);
+    }
+    if !cur.is_empty() {
+        parts.push(anth_merge(cur));
+    }
+    parts
+}
+
+/// The user's own words in a /v1/messages span, one entry per message: its
+/// text blocks (tool results and pictures are the record, not the user).
+pub fn anth_user_texts(span: &[Value]) -> Vec<String> {
+    span.iter()
+        .filter(|m| anth_role(m) == "user")
+        .filter_map(|m| {
+            let t: Vec<String> = anth_blocks(m)
+                .iter()
+                .filter(|b| block_type(b) == "text")
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect();
+            (!t.is_empty()).then(|| t.join("\n\n"))
+        })
+        .collect()
+}
+
+/// The message a later /v1/messages part opens with: the user's own words
+/// verbatim and the summary so far, then the blocks of the user message
+/// that leads the part, if one does (one user turn).
+pub fn anth_part_context(users: &[String], summary: &str, leading: Option<&Value>) -> Value {
+    let mut text = String::from("This conversation is being compacted in parts.");
+    for (i, u) in users.iter().enumerate() {
+        if i == 0 {
+            text.push_str("\n\nThe user's own messages so far (verbatim):");
+        }
+        text.push_str("\n\n");
+        text.push_str(u);
+    }
+    text.push_str("\n\nSummary of the conversation before the part that follows:\n\n");
+    text.push_str(summary);
+    let mut blocks = vec![json!({"type": "text", "text": text})];
+    blocks.extend(leading.map(anth_blocks).unwrap_or_default());
+    json!({"role": "user", "content": blocks})
 }
 
 /// A tool_use block's location + identity, in conversation order.
@@ -2281,5 +2508,109 @@ mod tests {
         assert!(a < b && b < x && x < y, "{t}");
         assert!(oa_part_next(true, true).contains("LAST part"));
         assert!(oa_part_next(false, true).contains("More parts follow"));
+    }
+
+    // -- summarization in parts, /v1/messages shape --
+
+    fn anth_round() -> Vec<Value> {
+        let result = |id: &str| json!({"type": "tool_result", "tool_use_id": id, "content": "r".repeat(400)});
+        let call = |id: &str| json!({"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": id}});
+        vec![
+            json!({"role": "user", "content": "Read all three."}),
+            json!({"role": "assistant", "content": [call("c1"), call("c2"), call("c3")]}),
+            json!({"role": "user", "content": [result("c1"), result("c2"), result("c3")]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "Done."}]}),
+        ]
+    }
+
+    fn tool_uses(m: &Value) -> Vec<String> {
+        anth_blocks(m)
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|b| b["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// One parallel round is one user message on /v1/messages, so a span
+    /// past the budget is cut between its tool_result blocks; a part that
+    /// opens with results re-carries their calls, roles still alternate, and
+    /// no block is lost or reordered.
+    #[test]
+    fn anth_parts_cut_between_blocks_and_recarry_calls() {
+        let span = anth_round();
+        assert_eq!(
+            anth_span_parts(&span, &chars_cost, 100_000),
+            vec![span.clone()],
+            "a span that fits is one part, untouched"
+        );
+        let parts = anth_span_parts(&span, &chars_cost, 900);
+        assert!(parts.len() >= 2, "{parts:#?}");
+        let mut results = Vec::new();
+        for p in &parts {
+            for w in p.windows(2) {
+                assert_ne!(w[0]["role"], w[1]["role"], "roles alternate: {p:#?}");
+            }
+            for (i, m) in p.iter().enumerate() {
+                for b in anth_blocks(m).iter().filter(|b| b["type"] == "tool_result") {
+                    let id = b["tool_use_id"].as_str().unwrap();
+                    assert!(
+                        p[..i].iter().any(|x| tool_uses(x).iter().any(|t| t == id)),
+                        "result {id} shown without its call: {p:#?}"
+                    );
+                    results.push(id.to_owned());
+                }
+            }
+        }
+        assert_eq!(results, ["c1", "c2", "c3"]);
+        assert_eq!(parts[0][0], span[0], "part 1 is the span's own prefix");
+        let last = parts.last().unwrap().last().unwrap();
+        assert_eq!(last, &span[3]);
+    }
+
+    /// A block that alone outgrows a part is cut down to fit, head and tail
+    /// kept; a tool_use input stays an object.
+    #[test]
+    fn anth_a_block_past_the_budget_is_elided_to_fit() {
+        let body = format!("HEAD{}TAIL", "x".repeat(10_000));
+        let span = vec![
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c1", "content": [{"type": "text", "text": body}]}
+            ]}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c2", "name": "Write",
+                 "input": {"file_path": "notes.md", "content": "y".repeat(5_000)}}
+            ]}),
+        ];
+        let parts = anth_span_parts(&span, &chars_cost, 2_000);
+        let flat: Vec<&Value> = parts.iter().flatten().collect();
+        assert_eq!(flat.len(), 2, "{parts:#?}");
+        assert!(flat.iter().all(|m| chars_cost(m) <= 2_000));
+        let t = flat[0]["content"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(t.starts_with("HEAD") && t.ends_with("TAIL"));
+        assert!(t.contains("characters omitted here to fit the summarization pass"));
+        let input = &flat[1]["content"][0]["input"];
+        assert_eq!(input["file_path"], "notes.md");
+        assert!(input["content"].as_str().unwrap().contains("omitted here"));
+    }
+
+    /// A later part opens with the user's own words verbatim and the summary
+    /// so far; tool results are not the user's words.
+    #[test]
+    fn anth_a_later_part_opens_with_users_and_the_summary_so_far() {
+        let users = anth_user_texts(&anth_round());
+        assert_eq!(users, ["Read all three."]);
+        let lead = json!({"role": "user", "content": "And the totals."});
+        let c = anth_part_context(&users, "S so far", Some(&lead));
+        assert_eq!(c["role"], "user");
+        let t = c["content"][0]["text"].as_str().unwrap();
+        assert!(t.find("Read all three.").unwrap() < t.find("S so far").unwrap());
+        assert_eq!(
+            c["content"][1],
+            json!({"type": "text", "text": "And the totals."})
+        );
+        assert!(anth_part_next(true).contains("LAST part"));
+        assert!(anth_part_next(false).contains("More parts follow"));
     }
 }

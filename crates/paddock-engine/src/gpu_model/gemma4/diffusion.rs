@@ -180,6 +180,13 @@ impl DiffusionLane {
                 exec.q8_embed_transpose_bf16(t, &mut bytes, n_vocab, n_embd)?;
             }
             EmbdTable::Kq(w) => exec.kq_embed_transpose_bf16(w, &mut bytes, n_vocab, n_embd)?,
+            // the loader keeps the raw rows until this lane is built
+            EmbdTable::Q8r(_) => {
+                return Err(LoadError::Tensor(
+                    "token_embd.weight".into(),
+                    "the diffusion lane transposes the raw Q8_0 rows".into(),
+                ));
+            }
         }
         let embd_t = QuantTensor {
             bytes,

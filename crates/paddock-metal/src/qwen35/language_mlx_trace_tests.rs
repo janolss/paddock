@@ -2,8 +2,92 @@
 use super::*;
 
 #[test]
+#[ignore = "requires independent MLX linear-normalization capture"]
+fn lighton_linear_normalization_contract() {
+    let root = std::env::var_os("PADDOCK_METAL_LANGUAGE_SEAMS").unwrap();
+    let root = Path::new(&root);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    let d = MetalDevice::new(Some(128 << 20)).unwrap();
+    let read = |suffix: &str| {
+        let bytes = std::fs::read(root.join(format!("layer-0-linear-{suffix}.f32"))).unwrap();
+        assert_eq!(bytes.len() % 4, 0, "truncated F32 capture: {suffix}");
+        bytes
+            .chunks_exact(4)
+            .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let q = read("query-input");
+    let k = read("key-input");
+    let qout = read("query-output");
+    let kout = read("key-output");
+    let info = &manifest["linear_normalization"]["layer-0"]["query-input"]["shape"];
+    let rows = info[0].as_u64().unwrap() as usize;
+    let width = info[1].as_u64().unwrap() as usize;
+    assert!(rows > 0 && width > 0);
+    assert_eq!(q.len(), rows * width);
+    assert_eq!(k.len(), q.len());
+    assert_eq!(qout.len(), q.len());
+    assert_eq!(kout.len(), q.len());
+    assert_eq!(width % 128, 0);
+    let raw: Vec<_> = q
+        .chunks_exact(width)
+        .zip(k.chunks_exact(width))
+        .flat_map(|(q, k)| {
+            q.iter()
+                .chain(k)
+                .copied()
+                .chain(std::iter::repeat_n(f32::NAN, 128))
+        })
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let input = d.upload(&raw).unwrap();
+    let cmd = d.begin().unwrap();
+    cmd.dispatch(
+        "mlx_dn_qk_norm",
+        &[&input],
+        &[width as u32 / 128, 1, (width * 2 + 128) as u32],
+        [width / 64, rows, 1],
+        32,
+    );
+    cmd.finish().unwrap();
+    let actual = unsafe { input.read_f32(0, raw.len() / 4) };
+    let mut different = 0;
+    for row in 0..rows {
+        let a = &actual[row * (width * 2 + 128)..][..width * 2 + 128];
+        let expected = qout[row * width..][..width]
+            .iter()
+            .chain(&kout[row * width..][..width]);
+        different += a
+            .iter()
+            .zip(expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(a[width * 2..].iter().all(|v| v.is_nan()));
+    }
+    eprintln!(
+        "LINEAR_NORMALIZATION different={different}/{}",
+        rows * width * 2
+    );
+    assert_eq!(
+        different, 0,
+        "linear normalization must match the independent MLX graph"
+    );
+}
+
+#[test]
 #[ignore = "requires language capture with rotary positions"]
 fn lighton_language_rotary_contract() {
+    lighton_language_rotary(false);
+}
+
+#[test]
+#[ignore = "requires independent MLX rotary capture; test-only contiguous normalization"]
+fn lighton_contiguous_rotary_contract() {
+    lighton_language_rotary(true);
+}
+
+fn lighton_language_rotary(contiguous: bool) {
     let root = std::env::var_os("PADDOCK_METAL_LANGUAGE_SEAMS").unwrap();
     let root = Path::new(&root);
     let manifest: serde_json::Value =
@@ -65,18 +149,26 @@ fn lighton_language_rotary_contract() {
     ];
     let cmd = d.begin().unwrap();
     cmd.dispatch(
-        "mlx_qnorm_rope",
+        if contiguous {
+            "mlx_qnorm_rope_contiguous"
+        } else {
+            "mlx_qnorm_rope"
+        },
         &[&q, &w.q_norm.buffer, &pos, &oq],
         &p,
         [model.geometry.heads, rows, 1],
-        32,
+        if contiguous { 64 } else { 32 },
     );
     cmd.dispatch(
-        "mlx_knorm_store",
+        if contiguous {
+            "mlx_knorm_store_contiguous"
+        } else {
+            "mlx_knorm_store"
+        },
         &[&k, &v, &w.k_norm.buffer, &meta, &pages, &ok, &ov, &pos],
         &p,
         [model.geometry.kv_heads, rows, 1],
-        32,
+        if contiguous { 64 } else { 32 },
     );
     cmd.finish().unwrap();
     let mut differences = 0;
@@ -121,7 +213,7 @@ fn lighton_language_rotary_contract() {
         eprintln!("LANGUAGE_ROTARY {name} outside_rotary={outside_rotary}");
         differences += different;
     }
-    if std::env::var_os("PADDOCK_METAL_REQUIRE_PARITY").is_some() {
+    if contiguous || std::env::var_os("PADDOCK_METAL_REQUIRE_PARITY").is_some() {
         assert_eq!(differences, 0);
     }
 }
@@ -250,6 +342,40 @@ fn paged_register_attention_preserves_ragged_tiles_pages_and_guards() {
 #[test]
 #[ignore = "requires --reference-results language capture; numerical ablation, not serving qualification"]
 fn lighton_language_generation_ablation() {
+    lighton_language_generations(true);
+}
+
+#[test]
+#[ignore = "requires independent language capture; strict production full-generation gate"]
+fn lighton_language_generation_contract() {
+    lighton_language_generations(false);
+}
+
+fn lighton_language_generations(ablation: bool) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            attention::BASELINE_HEAD_NORM_FOR_TEST.with(|v| v.set(true));
+            attention::BASELINE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(false));
+            attention::FORCE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(false));
+            crate::affine::REFERENCE_CHUNKS_FOR_TEST.with(|v| v.set(false));
+            crate::affine::REFERENCE_DECODE_FOR_TEST.with(|v| v.set(false));
+            crate::affine::REFERENCE_PREFILL_ROWS_FOR_TEST.set(0);
+            forward::PRECISE_RECURRENT_FOR_TEST.set(false);
+            forward::BASELINE_LIGHTON_FOR_TEST.set(false);
+        }
+    }
+    let _reset = Reset;
+    forward::BASELINE_LIGHTON_FOR_TEST.set(ablation);
+    crate::affine::REFERENCE_PREFILL_ROWS_FOR_TEST.set(
+        std::env::var("PADDOCK_METAL_CANONICAL_PREFILL")
+            .ok()
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(0),
+    );
+    attention::BASELINE_HEAD_NORM_FOR_TEST.with(|v| v.set(!ablation));
+    forward::PRECISE_RECURRENT_FOR_TEST
+        .set(std::env::var_os("PADDOCK_METAL_PRECISE_RECURRENT").is_some());
     use paddock_engine::service::MmChunk;
     let root = std::env::var_os("PADDOCK_METAL_LANGUAGE_SEAMS").unwrap();
     let root = Path::new(&root);
@@ -274,18 +400,25 @@ fn lighton_language_generation_ablation() {
         MmChunk::Text(ids(&f["after"])),
     ];
     let reference = ids(&f["reference"]["ids"]);
-    for (candidate, projection, decode) in [
-        (false, false, false),
-        (true, false, false),
-        (false, true, false),
-        (false, false, true),
-        (false, true, true),
-        (true, true, true),
-    ] {
+    assert!(!reference.is_empty(), "reference generation is empty");
+    let modes = if ablation {
+        vec![
+            (Some(false), false, false),
+            (Some(true), false, false),
+            (Some(false), true, false),
+            (Some(false), false, true),
+            (Some(true), false, true),
+            (Some(false), true, true),
+            (Some(true), true, true),
+        ]
+    } else {
+        vec![(None, false, false)]
+    };
+    for (candidate, projection, decode) in modes {
         let mut model = Qwen35::load(path, 4096, 4, None).unwrap();
         model.attach_vision(path).unwrap();
-        attention::BASELINE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(!candidate));
-        attention::FORCE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(candidate));
+        attention::BASELINE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(candidate == Some(false)));
+        attention::FORCE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(candidate == Some(true)));
         crate::affine::REFERENCE_CHUNKS_FOR_TEST.with(|v| v.set(projection));
         crate::affine::REFERENCE_DECODE_FOR_TEST.with(|v| v.set(decode));
         let (mut logits, prompt) = model.prefill_images(0, &chunks).unwrap();
@@ -319,6 +452,12 @@ fn lighton_language_generation_ablation() {
             serde_json::json!({"nax":candidate,"projection":projection,"decode":decode,"tokens":generated,"reference":reference,"exact":generated==reference,"stopped":stopped,"decode_seconds":start.elapsed().as_secs_f64()})
         );
         assert!(stopped, "generation cap, not natural EOS");
+        if !ablation {
+            assert_eq!(
+                generated, reference,
+                "full-generation parity, including grounding"
+            );
+        }
     }
 }
 
@@ -339,6 +478,10 @@ fn lighton_language_operation_contracts() {
     let d = &model.device;
     let mut total = 0;
     for (name, info) in manifest["operations"].as_object().unwrap() {
+        if name.ends_with("-linear_attn.norm") {
+            // This two-input, head-wise operation has its own recurrent gate.
+            continue;
+        }
         let rest = name.strip_prefix("layer-").unwrap();
         let (index, op) = rest.split_once('-').unwrap();
         let layer = &model.layers[index.parse::<usize>().unwrap()];

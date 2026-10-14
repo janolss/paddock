@@ -211,6 +211,10 @@ pub struct RamTransport {
     expect_store: HashMap<LogicalKey, XferSpec>,
     expect_load: HashMap<LogicalKey, XferSpec>,
     q_store: VecDeque<Queued>,
+    /// Stores whose T1 extent could not be carved while the slab supply is
+    /// still delivering the budget: retried at every kick, never completed
+    /// NoRoom until the supply is done (a dropped store is lost content).
+    q_held: VecDeque<(IoJob, XferSpec)>,
     q_load: VecDeque<Queued>,
     /// Quota-eviction outbox: keys `make_room` retired, awaiting the pump's
     /// catalog invalidation.
@@ -355,6 +359,7 @@ impl RamTransport {
             expect_store: HashMap::new(),
             expect_load: HashMap::new(),
             q_store: VecDeque::new(),
+            q_held: VecDeque::new(),
             q_load: VecDeque::new(),
             t2_evicted: Vec::new(),
             t2_pending: VecDeque::new(),
@@ -809,8 +814,35 @@ impl RamTransport {
         }
     }
 
+    /// Stores held for the slab supply: carve what fits now, complete the
+    /// rest NoRoom once the supply is done and the arena still has no hole.
+    fn retry_held(&mut self) {
+        let n = self.q_held.len();
+        for _ in 0..n {
+            let Some((job, spec)) = self.q_held.pop_front() else {
+                break;
+            };
+            match self.store.alloc(job.bytes) {
+                Ok(host_loc) => self.q_store.push_back(Queued {
+                    job,
+                    spec,
+                    host_loc,
+                }),
+                Err(_) if !self.store.supply_done() => self.q_held.push_back((job, spec)),
+                Err(e) => {
+                    tracing::debug!(err = %e, "KV tier store: no room in T1 (after hold)");
+                    self.ready.push(IoCompletion {
+                        op: job.op,
+                        outcome: IoOutcome::NoRoom,
+                    });
+                }
+            }
+        }
+    }
+
     /// Start whatever the queues and the no-duplex rule allow.
     fn kick(&mut self) {
+        self.retry_held();
         // Loads first, always - and drain the whole queue onto the lane
         // stream: the lane serializes staging-extent reuse, and per-flight
         // done events let one pump retire them all. One-flight-per-pump
@@ -910,6 +942,14 @@ impl TierTransport for RamTransport {
                 // took a merely full tier offline for good
                 let host_loc = match self.store.alloc(job.bytes) {
                     Ok(l) => l,
+                    Err(e) if !self.store.supply_done() => {
+                        // the budget is still being carved off-thread: hold
+                        // the store and retry it at the next kick rather
+                        // than dropping content the GPU has already shed
+                        tracing::debug!(err = %e, "KV tier store: held for the slab supply");
+                        self.q_held.push_back((job, spec));
+                        return Ok(());
+                    }
                     Err(e) => {
                         tracing::debug!(err = %e, "KV tier store: no room in T1");
                         self.ready.push(IoCompletion {

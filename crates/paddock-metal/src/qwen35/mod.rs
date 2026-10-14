@@ -25,6 +25,8 @@ use geometry::Geometry;
 #[cfg(test)]
 mod few_bench;
 #[cfg(test)]
+mod head_norm_tests;
+#[cfg(test)]
 mod language_mlx_trace_tests;
 mod load;
 mod lookup;
@@ -44,6 +46,8 @@ mod projection;
 mod projection_tests;
 #[cfg(test)]
 mod quant_boundary_tests;
+#[cfg(test)]
+mod recurrent_mlx_trace_tests;
 mod retention;
 #[cfg(test)]
 mod retention_tests;

@@ -277,6 +277,7 @@ impl Qwen35 {
                 rows,
                 workspace,
                 if head { &head_span } else { spans },
+                self.lighton_reference_math(),
             );
         }
         #[cfg(test)]

@@ -310,6 +310,7 @@ fn packed_affine_fused_rows_preserve_bits_offsets_and_guards() {
                         count + 1,
                         &workspace,
                         &spans,
+                        false,
                     );
                     cmd.finish().unwrap();
                     let got: Vec<Vec<u32>> = outputs

@@ -46,9 +46,10 @@ pub enum Dialect {
     QwenXml,
     /// Gemma 4 channels: `<|channel>thought\n...<channel|>` reasoning, then
     /// content. `<|channel>`/`<channel|>` are single special tokens (ids
-    /// 100/101), so they decode atomically like Harmony's markers. Tool-call
-    /// channels parse with the gemma4 tools milestone - until then non-thought
-    /// channels pass through as content (nothing silently disappears).
+    /// 100/101), so they decode atomically like Harmony's markers. Tool calls
+    /// are `<|tool_call>call:NAME{...}<tool_call|>` blocks in the template's
+    /// own value syntax (crate::gemma_tools), and the turn ends at
+    /// `<|tool_response>`.
     GemmaChannel,
     /// Laguna (poolside) GLM-shaped XML: `<think>` blocks like qwen, but tool
     /// calls are `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...
@@ -188,11 +189,25 @@ impl Dialect {
     /// (chat, messages, responses): qwen3.5 pre-opens `<think>\n`; laguna
     /// pre-opens a bare `<think>` (thinking on) or pre-closes `</think>`
     /// (off - which never suffix-matches `<think>`, so the probe is safe);
-    /// gemma4 pre-closes an empty thought channel when thinking is off, so
-    /// thinking is on exactly when that suffix is absent.
+    /// gemma4 ends its thinking-on generation prompt on the bare model header
+    /// (off pre-closes an empty thought channel after it).
     pub fn thinking_open(self, prompt: &str) -> bool {
         match self {
-            Dialect::GemmaChannel => !prompt.ends_with("<channel|>"),
+            // the bare model header is the thinking-on generation prompt (off
+            // pre-closes an empty thought after it). The model's own turn also
+            // continues after its tool results with no header: the current
+            // template opens the thought there itself when thinking is on
+            // (`<|channel>thought\n` after `<tool_response|>`); the older one
+            // writes nothing, and a thinking conversation (`<|think|>` in its
+            // system turn) still goes on thinking - without an opener the model
+            // writes its thought, then `<channel|>`, straight into what reads
+            // as content (seen live). A prefill or a thinking-off turn is no
+            // open thought.
+            Dialect::GemmaChannel => {
+                prompt.ends_with("<|turn>model\n")
+                    || prompt.ends_with(G_THOUGHT)
+                    || (prompt.ends_with("<tool_response|>") && prompt.contains("<|think|>"))
+            }
             Dialect::Laguna => prompt.ends_with("<think>"),
             Dialect::JsonThinking => prompt.trim_end().ends_with("<think>"),
             // granite 4.1's template has no thinking region to open - say so
@@ -244,7 +259,7 @@ impl Dialect {
             Dialect::JsonThinking => &["<tool_call>", JSON_BARE_OPEN, "<think>", "</think>"],
             // atomic special tokens can't split across deltas, but a marker
             // in the running text must still gate what streams as content
-            Dialect::GemmaChannel => &["<|channel>"],
+            Dialect::GemmaChannel => &["<|channel>", crate::gemma_tools::CALL],
             // muse-glimmer's four structure markers are single special ids
             // (200022/200023/200007/200008), so they arrive whole. The part
             // that does split is the ` to=RECIPIENT` header text, and holding
@@ -261,8 +276,7 @@ impl Dialect {
     ///
     /// A dialect belongs here only once its parser reads that syntax back:
     /// forcing a call whose text never becomes `tool_calls` would hand the
-    /// client raw markup and call it content. That is why gemma4 is absent -
-    /// its tool channels aren't parsed yet.
+    /// client raw markup and call it content.
     pub fn tool_syntax(self) -> Option<crate::constrained::ToolSyntax> {
         use crate::constrained::ToolSyntax;
         match self {
@@ -271,6 +285,7 @@ impl Dialect {
             Dialect::JsonToolCall | Dialect::JsonThinking => Some(ToolSyntax::Json),
             Dialect::MuseChannel => Some(ToolSyntax::AtemXml),
             Dialect::MiniCpmXml => Some(ToolSyntax::MiniCpmXml),
+            Dialect::GemmaChannel => Some(ToolSyntax::GemmaCall),
             _ => None,
         }
     }
@@ -313,7 +328,7 @@ impl Dialect {
             Dialect::JsonThinking => &["</think>", "<tool_call>"],
             Dialect::MiniCpmXml => &["</think>", MINICPM_FUNC],
             Dialect::Laguna => &["</think>"],
-            Dialect::GemmaChannel => &["<channel|>"],
+            Dialect::GemmaChannel => &["<channel|>", crate::gemma_tools::CALL],
             // muse-glimmer closes a thought with `<|eom|>`, a single special
             // id - same reasoning as `content_markers`
             _ => &[],
@@ -344,6 +359,12 @@ impl Dialect {
             // handler preserves exactly these four (plus the think pair,
             // which never sits inside a call here).
             Dialect::MiniCpmXml => &[MINICPM_FUNC, "</function>", "<param", "</param>"],
+            // gemma4's call markers and its string delimiter are specials
+            Dialect::GemmaChannel => &[
+                crate::gemma_tools::CALL,
+                crate::gemma_tools::CALL_END,
+                crate::gemma_tools::STR,
+            ],
             _ => &[],
         }
     }
@@ -449,7 +470,7 @@ pub fn parse(
         Dialect::Harmony => crate::harmony::parse(text, hints.is_some()),
         Dialect::QwenXml => qwen_parse(text, thinking_open, hints),
         Dialect::MiniCpmXml => minicpm_parse(text, thinking_open, hints),
-        Dialect::GemmaChannel => gemma_parse(text, thinking_open),
+        Dialect::GemmaChannel => gemma_parse(text, thinking_open, hints),
         Dialect::Laguna => laguna_parse(text, thinking_open, hints),
         Dialect::MuseChannel => crate::muse::parse(text, thinking_open, hints),
         Dialect::JsonToolCall => json_tool_parse(text, hints),
@@ -512,6 +533,27 @@ pub(crate) const G_CLOSE: &str = "<channel|>";
 /// idle, ~+600 ms under admission bursts). Forced into the prompt, the
 /// token sampled from the PREFILL logits is already visible reasoning text.
 /// Kill: PADDOCK_G4_NO_PREOPEN=1 (the model generates the opener again).
+/// Gemma 4's model turn continues after its tool results with no header, and
+/// a thinking-off conversation gets no framing there at all: the template
+/// opens a thought after `<tool_response|>` only when thinking is on. A fresh
+/// thinking-off turn starts with an empty pre-closed thought
+/// (`<|channel>thought\n<channel|>`) instead, and without one the model has to
+/// start writing straight after the last tool result - fine after text, but
+/// after a picture it wrote garbage (`da-3-6-2-2-2...`, measured on 26B-A4B).
+/// True when the prompt is such a continuation: the last turn holds a tool
+/// result and nothing after it opened or closed a thought.
+pub(crate) fn g4_post_tool_unframed(prompt: &str) -> bool {
+    let turn = &prompt[prompt.rfind("<|turn>").unwrap_or(0)..];
+    let Some(r) = turn.rfind("<tool_response|>") else {
+        return false;
+    };
+    let after = &turn[r..];
+    !after.contains("<|channel>") && !after.contains(G_CLOSE) && !after.contains("<turn|>")
+}
+
+/// The pre-closed empty thought a thinking-off Gemma 4 turn opens with.
+pub(crate) const G_THOUGHT_CLOSED: &str = "<|channel>thought\n<channel|>";
+
 pub(crate) fn g4_preopen() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_G4_NO_PREOPEN").is_none())
@@ -520,11 +562,13 @@ pub(crate) fn g4_preopen() -> bool {
 /// Gemma 4 assistant output (thinking on - the serving default): the turn
 /// opens with a thought channel, content follows its close. Mid-stream, an
 /// unclosed thought is all reasoning. Without a thought channel the whole
-/// text is content. Non-thought channels (tool_call) are content until the
-/// gemma4 tools milestone parses them. `thinking_open`: the prompt already
-/// pre-opened the thought channel, so the text starts inside it (a
-/// model-generated opener is still stripped - the kill-env path keeps it).
-fn gemma_parse(text: &str, thinking_open: bool) -> Parsed {
+/// text is content. Tool-call blocks are calls wherever they appear - the
+/// thought channel included, qwen's precedent for a call written before the
+/// reasoning closed - and only when the request declared tools.
+/// `thinking_open`: the prompt already pre-opened the thought channel, so the
+/// text starts inside it (a model-generated opener is still stripped - the
+/// kill-env path keeps it).
+fn gemma_parse(text: &str, thinking_open: bool, hints: Option<&ToolHints>) -> Parsed {
     // Tail whitespace is generated output, not channel framing. Trimming it
     // here buffers whitespace-only tokens until the next word and doubles
     // many SSE gaps; trimming a closed thought also retracts emitted bytes.
@@ -541,32 +585,36 @@ fn gemma_parse(text: &str, thinking_open: bool) -> Parsed {
         (None, true) => Some(trimmed),
         (None, false) => None,
     };
-    if let Some(after) = after {
-        match after.find(G_CLOSE) {
-            Some(end) => {
-                let reasoning = after[..end].trim_start();
-                let content = after[end + G_CLOSE.len()..].trim_start();
-                Parsed {
-                    reasoning: (!reasoning.is_empty()).then(|| reasoning.to_owned()),
-                    content: (!content.is_empty()).then(|| content.to_owned()),
-                    ..Parsed::default()
-                }
-            }
-            None => Parsed {
-                reasoning: {
-                    let r = after.trim_start();
-                    (!r.is_empty()).then(|| r.to_owned())
-                },
-                ..Parsed::default()
-            },
+    let (reasoning, content) = match after {
+        Some(after) => match after.find(G_CLOSE) {
+            Some(end) => (Some(&after[..end]), Some(&after[end + G_CLOSE.len()..])),
+            None => (Some(after), None),
+        },
+        None => (None, Some(trimmed)),
+    };
+    let mut out = Parsed::default();
+    // no tools declared -> no extraction: the syntax is just text
+    let scan = |region: &str, out: &mut Parsed| -> String {
+        match hints {
+            Some(_) => crate::gemma_tools::scan_calls(region, out),
+            None => region.to_owned(),
         }
-    } else {
-        let t = trimmed;
-        Parsed {
-            content: (!t.is_empty()).then(|| t.to_owned()),
-            ..Parsed::default()
+    };
+    if let Some(r) = reasoning {
+        let r = scan(r, &mut out);
+        let r = r.trim_start();
+        if !r.is_empty() {
+            out.reasoning = Some(r.to_owned());
         }
     }
+    if let Some(c) = content {
+        let c = scan(c, &mut out);
+        let c = c.trim_start();
+        if !c.is_empty() {
+            out.content = Some(c.to_owned());
+        }
+    }
+    out
 }
 
 const THINK: &str = "<think>";

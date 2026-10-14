@@ -231,6 +231,7 @@ impl ToolStream {
         };
         let mut progress = match dialect {
             Dialect::QwenXml => qwen_progress(text, thinking_open, hints),
+            Dialect::GemmaChannel => crate::gemma_tools::progress(text, thinking_open),
             _ => whole(parsed, parsed.complete_calls),
         };
         if single {

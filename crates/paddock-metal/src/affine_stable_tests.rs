@@ -88,8 +88,22 @@ fn llama_affine_cohorts_preserve_isolated_contracts_and_scratch_grants() {
 
 #[test]
 fn stable_affine_mixed_phases_preserve_isolated_rows_and_guards() {
-    let device = MetalDevice::new(None).unwrap();
-    for k in [5120usize, 6144, 17408] {
+    stable_affine_mixed_phases(false);
+}
+
+#[test]
+fn lighton_bf16_decode_preserves_mixed_phases_and_guards() {
+    stable_affine_mixed_phases(true);
+}
+
+fn stable_affine_mixed_phases(bf16_bias_decode: bool) {
+    let device = MetalDevice::new(None).expect("Metal mixed-phase device");
+    let widths = if bf16_bias_decode {
+        [2560usize, 4096, 9216]
+    } else {
+        [5120, 6144, 17408]
+    };
+    for k in widths {
         let ns = [48usize, 65, 129];
         let weights: Vec<_> = ns
             .iter()
@@ -111,7 +125,7 @@ fn stable_affine_mixed_phases_preserve_isolated_rows_and_guards() {
                     }));
                 }
                 Weight {
-                    buffer: device.upload(&bytes).unwrap(),
+                    buffer: device.upload(&bytes).expect("affine test weights"),
                     ty: affine::AFFINE4,
                     k,
                     n,
@@ -124,28 +138,41 @@ fn stable_affine_mixed_phases_preserve_isolated_rows_and_guards() {
                     .flat_map(|i| bf(((i * 37) % 1999) as f32 / 113. - 8.).to_le_bytes())
                     .collect::<Vec<_>>(),
             )
-            .unwrap();
+            .expect("affine test input");
         let outputs: Vec<_> = ns
             .iter()
-            .map(|n| device.alloc((512 * n + 32) * 4).unwrap())
+            .map(|n| device.alloc((512 * n + 32) * 4).expect("guarded output"))
             .collect();
         let workspace_bytes = ns
             .iter()
             .map(|n| affine::workspace_bytes(k, *n, 512))
             .max()
-            .unwrap();
-        let workspace = device.alloc(workspace_bytes + 128).unwrap();
+            .expect("nonempty projection group");
+        let workspace = device
+            .alloc(workspace_bytes + 128)
+            .expect("guarded workspace");
         let planes: Vec<_> = weights.iter().zip(&outputs).collect();
-        let cmd = device.begin().unwrap().with_affine_prefill_rows(512);
+        let cmd = device
+            .begin()
+            .expect("prefill command")
+            .with_affine_prefill_rows(if bf16_bias_decode { 2048 } else { 512 });
         affine::project(&cmd, &planes, &x, 512, &workspace);
-        cmd.finish().unwrap();
+        cmd.finish().expect("prefill reference execution");
         let prefill: Vec<_> = planes
             .iter()
             .map(|(w, out)| unsafe { out.read_f32(0, 31 * w.n) })
             .collect();
-        let cmd = device.begin().unwrap();
-        affine::project_stable(&cmd, &planes, &x, 31, &workspace, &[(0, 31, 1)]);
-        cmd.finish().unwrap();
+        let cmd = device.begin().expect("decode reference command");
+        affine::project_stable(
+            &cmd,
+            &planes,
+            &x,
+            31,
+            &workspace,
+            &[(0, 31, 1)],
+            bf16_bias_decode,
+        );
+        cmd.finish().expect("decode reference execution");
         let decode: Vec<_> = planes
             .iter()
             .map(|(w, out)| unsafe { out.read_f32(0, 31 * w.n) })
@@ -168,9 +195,17 @@ fn stable_affine_mixed_phases_preserve_isolated_rows_and_guards() {
                 workspace.write_u32(&vec![u32::MAX; workspace.len() / 4]);
             }
             let rows = spans.iter().map(|s| s.1).sum();
-            let cmd = device.begin().unwrap();
-            affine::project_stable(&cmd, &planes, &x, rows, &workspace, &spans);
-            cmd.finish().unwrap();
+            let cmd = device.begin().expect("mixed-phase command");
+            affine::project_stable(
+                &cmd,
+                &planes,
+                &x,
+                rows,
+                &workspace,
+                &spans,
+                bf16_bias_decode,
+            );
+            cmd.finish().expect("mixed-phase execution");
             for (plane, (w, out)) in planes.iter().enumerate() {
                 let got = unsafe { out.read_f32(0, 512 * w.n + 32) };
                 for &(first, count, phase) in &spans {

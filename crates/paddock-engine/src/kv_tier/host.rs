@@ -79,11 +79,10 @@ fn touch_pages(buf: &mut SlabMem) {
     }
 }
 
-/// A slab's bytes. On Linux an anonymous mapping advised onto transparent
-/// huge pages - faulting a GiB in 2 MiB pages instead of 4 KiB ones measured
-/// 19 ms vs 200 ms on GB10, and registering it 28 ms vs 56 ms. Distros ship
-/// THP as `madvise`, so without the advice every slab was the slow kind.
-/// Elsewhere, or if the mapping is refused, zeroed heap memory as before.
+/// A slab's bytes. On Linux a pre-populated anonymous mapping (4 KiB pages:
+/// the THP advice this used to carry stalled the supply for 10-22 s per GiB
+/// on fragmented x86 hosts, see `SlabMem::new`). Elsewhere, or if the
+/// mapping is refused, zeroed heap memory as before.
 enum SlabMem {
     #[cfg(target_os = "linux")]
     Mapped {
@@ -109,16 +108,19 @@ impl SlabMem {
                     std::ptr::null_mut(),
                     len,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
                     -1,
                     0,
                 )
             };
             if p != libc::MAP_FAILED {
-                // advice, not a contract: THP off or unavailable just leaves
-                // 4 KiB pages, which is what the heap path gets anyway
-                // SAFETY: p..p+len is the mapping created above.
-                let _ = unsafe { libc::madvise(p, len, libc::MADV_HUGEPAGE) };
+                // No MADV_HUGEPAGE: on a loaded x86 box with the distro
+                // default `transparent_hugepage/defrag = madvise`, the advice
+                // put every fault through synchronous direct compaction -
+                // 10-22 s per GiB measured (vs 19 ms on an idle GB10), with
+                // >90% of the faults falling back to 4 KiB pages anyway. A
+                // populated plain mapping faults in-kernel at ~0.3 s/GiB
+                // regardless of fragmentation; `touch_pages` then costs ms.
                 return Self::Mapped { ptr: p.cast(), len };
             }
         }
@@ -579,9 +581,12 @@ impl HostStore {
     /// each rounded extent CONTIGUOUS inside one slab, so a ledger with room
     /// can still sit on an arena whose free bytes are holes too small for the
     /// next extent. Eviction asks this, not the ledger, when it is done.
-    /// Budget a running `SlabSupply` has not delivered yet counts as
-    /// growth: eviction must never cut holes for capacity that is on its
-    /// way (`alloc` answers no-room for those few seconds instead).
+    /// Budget a running `SlabSupply` has not delivered yet is NOT room:
+    /// `alloc` cannot grow into it, so while the supply runs the arena is
+    /// exactly the slabs delivered so far and eviction must open holes in
+    /// those. (Counting the undelivered budget as growth made every store
+    /// of a filling tier complete NoRoom - dropped, not retried - for as
+    /// long as the supply took: minutes per 10 GiB on a fragmented host.)
     pub fn fits(&self, payloads: &[u64]) -> bool {
         let mut free: Vec<Vec<(u64, u64)>> = self.slabs.iter().map(|s| s.free.clone()).collect();
         let mut used: u64 = self.slabs.iter().map(|s| s.mem.len() as u64).sum();
@@ -597,6 +602,9 @@ impl HostStore {
                     }
                     continue 'next;
                 }
+            }
+            if self.supply.as_ref().is_some_and(|s| !s.done) {
+                return false; // no growth until the supply has delivered
             }
             let room = self.capacity.saturating_sub(used);
             let want = self.slab_bytes.min(room).max(rounded.min(room));

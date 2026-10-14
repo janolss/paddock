@@ -7,6 +7,7 @@ thread_local! {
     pub(super) static BASELINE_GQA_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static BASELINE_LANGUAGE_NAX_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static FORCE_LANGUAGE_NAX_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static BASELINE_HEAD_NORM_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 fn split_append(rows: usize, visible_kv: usize, workspace_bytes: usize, heads: usize) -> bool {
@@ -14,8 +15,18 @@ fn split_append(rows: usize, visible_kv: usize, workspace_bytes: usize, heads: u
 }
 
 impl Qwen35 {
+    pub(super) fn contiguous_head_normalization(&self) -> bool {
+        let enabled = self.lighton_reference_math();
+        #[cfg(test)]
+        let enabled = enabled
+            || (self.mlx
+                && matches!(self.geometry, Geometry::DENSE_08B | Geometry::DENSE_4B)
+                && !BASELINE_HEAD_NORM_FOR_TEST.with(|v| v.get()));
+        enabled
+    }
+
     pub(super) fn register_language_attention(&self) -> bool {
-        let shape = self.geometry == Geometry::DENSE_08B;
+        let shape = self.geometry == Geometry::DENSE_08B || self.lighton_reference_math();
         #[cfg(test)]
         let shape = shape
             || (self.geometry == Geometry::DENSE_4B
@@ -60,8 +71,12 @@ impl Qwen35 {
             self.eps.to_bits(),
             self.rotary as u32,
         ];
+        let contiguous_norm = self.contiguous_head_normalization();
+        let norm_threads = if contiguous_norm { 64 } else { 32 };
         cmd.dispatch(
-            if self.mlx {
+            if contiguous_norm {
+                "mlx_qnorm_rope_contiguous"
+            } else if self.mlx {
                 "mlx_qnorm_rope"
             } else {
                 "qwen_qnorm_rope"
@@ -69,10 +84,12 @@ impl Qwen35 {
             &[&s.qraw, &w.q_norm.buffer, &s.mrope, &s.q],
             &p,
             [heads, m, 1],
-            32,
+            norm_threads,
         );
         cmd.dispatch(
-            if self.mlx {
+            if contiguous_norm {
+                "mlx_knorm_store_contiguous"
+            } else if self.mlx {
                 "mlx_knorm_store"
             } else {
                 "qwen_knorm_store"
@@ -89,7 +106,7 @@ impl Qwen35 {
             ],
             &p,
             [kv_heads, m, 1],
-            32,
+            norm_threads,
         );
         if tiles > 0 {
             // Only elect the indexed traversal on the measured M5 dense-27B
@@ -348,7 +365,11 @@ impl Qwen35 {
         }
         cmd.dispatch(
             if self.mlx {
-                "mlx_attn_gate"
+                if self.precise_recurrent_arithmetic() {
+                    "mlx_attn_gate_precise"
+                } else {
+                    "mlx_attn_gate"
+                }
             } else {
                 "qwen_attn_gate"
             },

@@ -105,10 +105,14 @@ struct NativeReadsLayoutTests {
         var navigation = WorkspaceNavigation()
         navigation.studio = .reads
         let footer = NSHostingController(
-          rootView: StudioSidebarFooter(navigation: .constant(navigation)))
-        // Tables adds one destination; reserve its row instead of squeezing
-        // the existing, accessible 32-point footer targets.
-        #expect(footer.sizeThatFits(in: NSSize(width: width, height: 168)).height <= 168)
+          rootView: StudioSidebarFooter(navigation: .constant(navigation))
+            .environment(\.colorScheme, dark ? .dark : .light))
+        // Chats, Tables, Embeddings, Prompt library and Settings. Reads replaces
+        // itself with Chats; the same five accessible rows must fit either way.
+        let footerHeight: CGFloat = 5 * 34 + 4 * 3 + 22
+        let fit = footer.sizeThatFits(in: NSSize(width: width, height: footerHeight))
+        #expect(fit.width <= width + 1)
+        #expect(abs(fit.height - footerHeight) <= 1)
       }
     }
   }

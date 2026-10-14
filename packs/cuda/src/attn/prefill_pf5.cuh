@@ -2597,12 +2597,12 @@ static int pd_attn_prefill_f16_paged_impl(
                                      PD_AF3W_SMEM);
                 cudaFuncSetAttribute((const void*)pd_attn_prefill_f16_v3w_kernel<512u, __nv_fp8_e4m3>,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     PD_AF3W_SMEM);
+                                     PD_AF3W_SMEM_F8);
                 a3w = true;
             }
             dim3 gw(n_kv_heads, (batch + PD_AF3W_NR - 1u) / PD_AF3W_NR, 2u);
             if (kv_dtype == PD_KV_FP8_E4M3)
-                pd_attn_prefill_f16_v3w_kernel<512u, __nv_fp8_e4m3><<<gw, 256, PD_AF3W_SMEM, (cudaStream_t)stream>>>(
+                pd_attn_prefill_f16_v3w_kernel<512u, __nv_fp8_e4m3><<<gw, 256, PD_AF3W_SMEM_F8, (cudaStream_t)stream>>>(
                     (const float*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
@@ -3572,13 +3572,13 @@ static int pd_attn_prefill_f16_paged2_impl(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, PD_AF3W_SMEM);
             cudaFuncSetAttribute(
                 (const void*)pd_attn_prefill_f16_v3w_kernel<512u, __nv_fp8_e4m3, __half, __half>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, PD_AF3W_SMEM);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, PD_AF3W_SMEM_F8);
             a3w16 = true;
         }
         dim3 gw(n_kv_heads, (batch + PD_AF3W_NR - 1u) / PD_AF3W_NR, 2u);
         if (kv_dtype == PD_KV_FP8_E4M3)
             pd_attn_prefill_f16_v3w_kernel<512u, __nv_fp8_e4m3, __half, __half>
-                <<<gw, 256, PD_AF3W_SMEM, (cudaStream_t)stream>>>(
+                <<<gw, 256, PD_AF3W_SMEM_F8, (cudaStream_t)stream>>>(
                 (const __half*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
                 (const float*)sinks, (__half*)out, (const unsigned int*)positions,
                 (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,

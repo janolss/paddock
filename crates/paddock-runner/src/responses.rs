@@ -37,7 +37,8 @@ use crate::chat::{
 use crate::chat_template;
 use crate::constrained::{CompiledSchema, ToolSet};
 use crate::loop_budget;
-use crate::parsers::{Dialect, Parsed, ToolHints, holdback, parse, tool_hints};
+use crate::parsers::{Dialect, Parsed, ToolHints, parse, tool_hints};
+use crate::responses_stream::{ev, safe_len};
 use crate::routes::AppState;
 use crate::serving::ServingModel;
 use crate::tool_stream::ToolEv;
@@ -442,6 +443,7 @@ fn prepare(
     let inlined = chat_template::inline_late_system_messages(messages, model.late_system_native)?;
     // arguments-strings -> objects, or templates drop them from history
     let mut messages = chat_template::normalize_messages(&inlined);
+    chat_template::strip_reasoning_close_newline(model.reasoning_close_nl, &mut messages);
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut messages, marker);
     }
@@ -1667,20 +1669,6 @@ fn response_events(
         yield ev(event_name, json!({
             "type":event_name,"sequence_number":sq.next(),"response":full}));
     }
-}
-
-fn ev(name: &str, data: Value) -> Result<Event, std::convert::Infallible> {
-    Ok(Event::default().event(name).data(data.to_string()))
-}
-
-/// Emit-safe prefix length: hold back a partial marker tail, on a char
-/// boundary.
-fn safe_len(s: &str, markers: &[&str]) -> usize {
-    let mut n = s.len() - holdback(s, markers);
-    while n > 0 && !s.is_char_boundary(n) {
-        n -= 1;
-    }
-    n
 }
 
 // ── context management  ──────────────────────────────────

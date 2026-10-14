@@ -360,18 +360,21 @@ pub(crate) fn kq_mm_rows(
     // the vocab head does not fit it (8 x 262144 x 64 f32) and takes the
     // z-tile, which needs no partials
     if r >= 3 && exec.has_kquant_mma_ks() && rows.part.len() >= 8 * 64 * out_dim {
-        exec.kquant_gemm_mma_ks(w, rows.xq, rows.xs, ss, rows.part, y, r)
+        exec.kquant_gemm_decode(w, rows.xq, rows.xs, ss, rows.part, y, r)
     } else {
         exec.kquant_gemm_dp4a(w, rows.xq, rows.xs, ss, y, r)
     }
 }
 
-/// Where the family's embedding rows come from. A Q8_0 or bf16 file keeps
-/// the raw table beside the repacked head (the row gathers read it, the
-/// diffusion lane transposes it); a k-quant file keeps no raw copy - its
-/// repacked head IS the table, and the gathers read that.
+/// Where the family's embedding rows come from. A tied head IS the table
+/// and nothing else is resident: a k-quant head on its repacked streams, a
+/// Q8_0 head through slot 832's gather out of its repacked plane (bit-
+/// identical to the raw gather), a bf16 head as the file's own bytes. The
+/// raw table stays only beside an untied head (muse-glimmer) or on a pack
+/// without slot 832.
 pub(crate) enum EmbdTable<'a> {
     Raw(&'a QuantTensor),
+    Q8r(&'a RepackedQ8),
     Kq(&'a RepackedKQ),
 }
 
@@ -381,11 +384,9 @@ impl<'a> EmbdTable<'a> {
     pub(crate) fn of(raw: &'a Option<QuantTensor>, head: &'a Plane) -> Self {
         match (raw, head) {
             (Some(t), _) => EmbdTable::Raw(t),
+            (None, Plane::Q8(w)) => EmbdTable::Q8r(w),
+            (None, Plane::Bf16(t)) => EmbdTable::Raw(t),
             (None, Plane::Kq(w)) => EmbdTable::Kq(w),
-            // the loader drops the raw table only when the head is k-quant
-            (None, _) => {
-                unreachable!("gemma4: raw embedding table dropped under a non-k-quant head")
-            }
         }
     }
 
@@ -401,6 +402,7 @@ impl<'a> EmbdTable<'a> {
     ) -> Result<(), GpuError> {
         match self {
             EmbdTable::Raw(t) => exec.embed_gather_plane(t, ids, out, embd, n, scale),
+            EmbdTable::Q8r(w) => exec.embed_gather_q8r(w, ids, out, embd, n, scale),
             EmbdTable::Kq(w) => {
                 exec.kquant_gather(w, ids, out, embd, n)?;
                 if scale != 1.0 {
@@ -423,6 +425,12 @@ impl<'a> EmbdTable<'a> {
     ) -> Result<(), GpuError> {
         match self {
             EmbdTable::Raw(t) => exec.dequant_slice(t, id as usize * t.row_bytes(embd), out),
+            EmbdTable::Q8r(w) => {
+                exec.stream
+                    .memcpy_htod(&[id], id_dev)
+                    .map_err(|e| GpuError::Driver(e.to_string()))?;
+                exec.embed_gather_q8r(w, id_dev, out, embd, 1, 1.0)
+            }
             EmbdTable::Kq(w) => {
                 exec.stream
                     .memcpy_htod(&[id], id_dev)

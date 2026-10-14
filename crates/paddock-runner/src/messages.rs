@@ -428,6 +428,8 @@ struct CompactPlan {
     instructions: Option<String>,
     pause: bool,
     messages: Vec<Value>,
+    /// the uncompacted prompt's tokenized length (a stream's message_start)
+    prompt_len: usize,
 }
 
 /// The conversion + render pipeline shared by generate and count_tokens.
@@ -562,6 +564,7 @@ fn render_prompt(
     // conservative size this surface was already serving.
     let images = model.decode_images(image_refs)?;
     let mut msgs = chat_template::normalize_messages(&msgs);
+    chat_template::strip_reasoning_close_newline(model.reasoning_close_nl, &mut msgs);
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut msgs, marker);
     }
@@ -629,8 +632,18 @@ fn render_prompt(
     if thinking_open
         && model.dialect == crate::parsers::Dialect::GemmaChannel
         && crate::parsers::g4_preopen()
+        // the template may have opened it already (after tool results)
+        && !prompt.ends_with(crate::parsers::G_THOUGHT)
     {
         prompt.push_str(crate::parsers::G_THOUGHT);
+    }
+    // gemma4 thinking off, continuing after tool results: close an empty
+    // thought the way a fresh thinking-off turn opens (see g4_post_tool_unframed)
+    if !thinking_open
+        && model.dialect == crate::parsers::Dialect::GemmaChannel
+        && crate::parsers::g4_post_tool_unframed(&prompt)
+    {
+        prompt.push_str(crate::parsers::G_THOUGHT_CLOSED);
     }
     let mut prompt_ids = model.tokenizer.encode(&prompt).map_err(|e| e.to_string())?;
     // BOS-leading families (gemma4): chat templates emit text only - the
@@ -772,6 +785,7 @@ fn prepare(
                     instructions: fire.instructions,
                     pause: fire.pause,
                     messages: edited,
+                    prompt_len: first.0.len(),
                 });
                 first
             } else if applied.edits.is_empty() {
@@ -1786,17 +1800,43 @@ fn anth_iteration(
     u
 }
 
-fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Response {
-    let sse = stream! {
-        yield ev("message_start", json!({"type": "message_start", "message": {
-            "id": ctx.id, "type": "message", "role": "assistant",
-            "model": ctx.model_id, "content": [],
+fn message_start(
+    id: &str,
+    model_id: &str,
+    prompt_len: usize,
+) -> Result<Event, std::convert::Infallible> {
+    ev(
+        "message_start",
+        json!({"type": "message_start", "message": {
+            "id": id, "type": "message", "role": "assistant",
+            "model": model_id, "content": [],
             "stop_reason": null, "stop_sequence": null,
-            "usage": {"input_tokens": ctx.prompt_len, "output_tokens": 0},
-        }}));
+            "usage": {"input_tokens": prompt_len, "output_tokens": 0},
+        }}),
+    )
+}
+
+fn stream_response(ctx: Ctx, rx: UnboundedReceiver<TokenEvent>) -> Response {
+    let start = message_start(&ctx.id, &ctx.model_id, ctx.prompt_len);
+    let body = stream_body(ctx, rx);
+    anth_sse(stream! {
+        yield start;
         // keep-alive ping after message_start, like the live API's streams
         yield ev("ping", json!({"type": "ping"}));
+        futures::pin_mut!(body);
+        while let Some(e) = futures::StreamExt::next(&mut body).await {
+            yield e;
+        }
+    })
+}
 
+/// A stream's events after message_start: the blocks, message_delta,
+/// message_stop (or the `error` event).
+fn stream_body(
+    mut ctx: Ctx,
+    mut rx: UnboundedReceiver<TokenEvent>,
+) -> impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static {
+    stream! {
         let mut index = 0usize;      // current block index
         if let Some(c) = &ctx.compaction {
             // SDK-pinned event shape: start, one compaction_delta carrying
@@ -1920,8 +1960,7 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
         }
         yield ev("message_delta", delta_ev);
         yield ev("message_stop", json!({"type": "message_stop"}));
-    };
-    anth_sse(sse)
+    }
 }
 
 // -- server-side compaction (compact_20260112) - the summarization pass and

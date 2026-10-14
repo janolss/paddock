@@ -4256,7 +4256,10 @@ Paddock replaces the Python/PyTorch execution with its own bounded Metal
 and CUDA graphs, kernels and service. The fitted numerical/categorical recipe and
 ensemble reduction are reimplemented in Rust. Paddock uses a portable seeded
 random stream instead of PyTorch's device-specific RNG. It does not bundle
-the SDM Python package. ECOC for more than ten classes is not implemented.
+the SDM Python package. Classification past ten classes reimplements SDM's
+error-correcting output codes (`sdm/models/ecoc.py`), which upstream marks
+as derived from TabPFN Extensions (Copyright 2025 Prior Labs GmbH, Apache
+License 2.0): https://github.com/PriorLabs/tabpfn-extensions
 
 SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 Copyright 2026 Google LLC

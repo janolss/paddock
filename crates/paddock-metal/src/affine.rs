@@ -12,7 +12,7 @@ enum Arithmetic {
     Adaptive,
     Llama(usize),
     Verify(bool),
-    StablePrefill,
+    StablePrefill(usize),
     StableDecode,
 }
 
@@ -34,6 +34,7 @@ thread_local! {
     pub(crate) static BASELINE_DIRECT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static REFERENCE_CHUNKS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static REFERENCE_DECODE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static REFERENCE_PREFILL_ROWS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn compact_prefill_rows(rows: usize) -> bool {
@@ -265,6 +266,7 @@ pub(crate) fn project_stable(
     rows: usize,
     workspace: &Buffer,
     spans: &[(usize, usize, usize)],
+    lighton_contract: bool,
 ) {
     let mut end = 0;
     for &(first, count, logical) in spans {
@@ -286,10 +288,18 @@ pub(crate) fn project_stable(
             continue;
         }
         assert!(first == end && count > 0 && first + count <= rows && matches!(logical, 1 | 512));
-        let mode = if logical == 1 {
+        let mode = if logical == 1 && lighton_contract {
+            // The verifier shares packed weights across rows while retaining
+            // each row's single-vector BF16 bias-reduction tree. This does not
+            // depend on live batch size or the length of a future prompt.
+            Arithmetic::Verify(true)
+        } else if logical == 1 {
             Arithmetic::StableDecode
         } else {
-            Arithmetic::StablePrefill
+            // Match the reference's full-chunk gate contraction, but freeze
+            // it for every prompt row, including tails and cache suffixes.
+            // Physical scheduling still uses bounded <=512-row grants.
+            Arithmetic::StablePrefill(if lighton_contract { 2048 } else { 512 })
         };
         project_inner(cmd, planes, input, count, workspace, (mode, first));
         end += count;
@@ -434,7 +444,7 @@ fn project_group(
     } else {
         13
     };
-    let prefill = matches!(arithmetic, Arithmetic::StablePrefill)
+    let prefill = matches!(arithmetic, Arithmetic::StablePrefill(_))
         || (matches!(arithmetic, Arithmetic::Adaptive | Arithmetic::Llama(_))
             && logical_rows >= vector_limit);
     let fast_contract = matches!(arithmetic, Arithmetic::StableDecode);
@@ -442,10 +452,18 @@ fn project_group(
         fast_contract && rows > 1 && cmd.tensor_accelerated() && matches!(k, 1024 | 2048 | 3584);
     #[cfg(test)]
     let direct = direct && !BASELINE_DIRECT_FOR_TEST.with(|v| v.get());
-    let contraction_rows = if matches!(arithmetic, Arithmetic::StablePrefill) {
-        512
+    let contraction_rows = if let Arithmetic::StablePrefill(canonical) = arithmetic {
+        canonical
     } else {
         cmd.affine_prefill_rows().unwrap_or(logical_rows)
+    };
+    #[cfg(test)]
+    let contraction_rows = if matches!(arithmetic, Arithmetic::StablePrefill(_))
+        && REFERENCE_PREFILL_ROWS_FOR_TEST.get() > 0
+    {
+        REFERENCE_PREFILL_ROWS_FOR_TEST.get()
+    } else {
+        contraction_rows
     };
     #[cfg(test)]
     let contraction_rows = if REFERENCE_CHUNKS_FOR_TEST.with(|v| v.get()) {
@@ -573,7 +591,7 @@ fn project_group(
     // The short first-admission wave keeps its 32-row tile and exact BF16
     // partial tree. Pad weight staging and reuse each scale/bias across more
     // packed codes, as on the wide route; do not widen the admission grant.
-    let tiny_prompt = matches!(arithmetic, Arithmetic::StablePrefill) && rows < 13;
+    let tiny_prompt = matches!(arithmetic, Arithmetic::StablePrefill(_)) && rows < 13;
     #[cfg(test)]
     let tiny_prompt = tiny_prompt && !BASELINE_RAGGED_FOR_TEST.with(|v| v.get());
     let small_admission = cmd.tensor_accelerated()

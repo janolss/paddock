@@ -69,6 +69,10 @@ pub struct ServingModel {
     /// `chat_template::renders_tool_images`) - with a vision tower, a picture a
     /// tool returned reaches the model; otherwise it becomes a text note.
     pub tool_images: bool,
+    /// The template closes prior reasoning with its own newline (probed at
+    /// load, `chat_template::reasoning_close_newline`) - echoed reasoning
+    /// loses one trailing newline before it renders.
+    pub reasoning_close_nl: bool,
     /// which assistant-output syntax to parse (tool calls, reasoning)
     pub dialect: crate::parsers::Dialect,
     /// what reasoning control this checkpoint's own template implements -
@@ -2224,6 +2228,9 @@ pub(crate) fn load_with_residency(
         "<|im_end|>",
         "<end_of_turn>",
         "<turn|>",
+        // Gemma 4 writes it after its tool calls: the checkpoint's
+        // generation_config lists it as an eos (50) beside `<turn|>` (106)
+        "<|tool_response>",
         "<eos>",
         "</assistant>",
     ] {
@@ -2299,6 +2306,9 @@ pub(crate) fn load_with_residency(
     let tool_images = chat_template
         .as_deref()
         .is_some_and(crate::chat_template::renders_tool_images);
+    let reasoning_close_nl = chat_template
+        .as_deref()
+        .is_some_and(crate::chat_template::reasoning_close_newline);
     // What reasoning control this checkpoint implements, read off its own
     // template once at load - see `crate::reasoning` for why it cannot be a
     // table keyed on `arch` or `dialect`.
@@ -2394,6 +2404,7 @@ pub(crate) fn load_with_residency(
         task_tags,
         late_system_native,
         tool_images,
+        reasoning_close_nl,
         dialect,
         reasoning,
         // An attached mmproj is the whole test: every arm below fails the load
@@ -2605,6 +2616,9 @@ fn load_hf_dir(
     let tool_images = chat_template
         .as_deref()
         .is_some_and(crate::chat_template::renders_tool_images);
+    let reasoning_close_nl = chat_template
+        .as_deref()
+        .is_some_and(crate::chat_template::reasoning_close_newline);
     // What reasoning control this checkpoint implements, read off its own
     // template once at load - see `crate::reasoning` for why it cannot be a
     // table keyed on `arch` or `dialect`.
@@ -2680,6 +2694,7 @@ fn load_hf_dir(
         task_tags,
         late_system_native,
         tool_images,
+        reasoning_close_nl,
         dialect,
         reasoning,
         supports_vision,

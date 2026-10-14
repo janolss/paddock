@@ -31,7 +31,7 @@ inline void mlx_affine_stage8(device const uchar* w,uint K,uint N,ulong i,thread
 }
 kernel void mlx_small(device const bfloat* x [[buffer(0)]],device float* out [[buffer(1)]],
     constant uint* p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
-    if(i<p[0])out[i]=p[1]==1 ? -exp(float(x[i])) : float(x[i]);
+    if(i<p[0])out[i]=p[1]==2 ? -precise::exp(float(x[i])) : (p[1]==1 ? -exp(float(x[i])) : float(x[i]));
 }
 kernel void mlx_embed(device const uchar* w [[buffer(0)]],device const uint* ids [[buffer(1)]],
     device float* out [[buffer(2)]],constant uint* p [[buffer(3)]],uint i [[thread_position_in_grid]]) {

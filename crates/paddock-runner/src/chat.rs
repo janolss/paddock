@@ -373,10 +373,6 @@ pub(crate) fn instantiate_constraint(
 pub(crate) fn no_forced_tool_grammar(dialect: Dialect, knob: &str) -> String {
     let why = match dialect {
         Dialect::Harmony => "the gpt-oss Harmony channel grammar is a roadmap item",
-        Dialect::GemmaChannel => {
-            "gemma4 tool-call channels are not parsed yet, so a forced call could not \
-             come back as tool_calls"
-        }
         _ => "this model family has no tool-call syntax",
     };
     format!("tool_choice {knob} cannot be enforced on this model ({why}); use \"auto\" or \"none\"")
@@ -415,7 +411,7 @@ pub(crate) fn auto_tool_dispatch(
         return ConstraintSpec::None;
     };
     let Some(syntax) = model.dialect.tool_syntax() else {
-        return ConstraintSpec::None; // harmony / gemma4: no grammar yet
+        return ConstraintSpec::None; // harmony: no grammar yet
     };
     match ToolSet::compile(syntax, tools, None) {
         Ok(set) => ConstraintSpec::Dispatch(set, single),
@@ -1557,6 +1553,7 @@ fn prepare(
     let inlined =
         chat_template::inline_late_system_messages(&req.messages, model.late_system_native)?;
     let mut messages = chat_template::normalize_messages(&inlined);
+    chat_template::strip_reasoning_close_newline(model.reasoning_close_nl, &mut messages);
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut messages, marker);
     }
@@ -1608,8 +1605,18 @@ fn prepare(
     if thinking_open
         && model.dialect == crate::parsers::Dialect::GemmaChannel
         && crate::parsers::g4_preopen()
+        // the template may have opened it already (after tool results)
+        && !prompt.ends_with(crate::parsers::G_THOUGHT)
     {
         prompt.push_str(crate::parsers::G_THOUGHT);
+    }
+    // gemma4 thinking off, continuing after tool results: close an empty
+    // thought the way a fresh thinking-off turn opens (see g4_post_tool_unframed)
+    if !thinking_open
+        && model.dialect == crate::parsers::Dialect::GemmaChannel
+        && crate::parsers::g4_post_tool_unframed(&prompt)
+    {
+        prompt.push_str(crate::parsers::G_THOUGHT_CLOSED);
     }
     // encode with specials: the rendered prompt contains <|start|> etc. which
     // must map to their single ids
@@ -2867,13 +2874,11 @@ mod tests {
     use super::*;
 
     /// A family whose tool-call syntax has no grammar refuses honestly, and the
-    /// refusal says which reason applies - gemma4 is not "not done yet", it is
-    /// blocked until its tool channels parse at all, and that distinction is
-    /// the difference between "wait for a release" and "this cannot work".
+    /// refusal says which reason applies - a roadmap item, or a family with no
+    /// tool-call syntax at all.
     #[test]
     fn the_forced_tool_refusal_names_its_own_reason() {
         for (d, needle) in [
-            (Dialect::GemmaChannel, "not parsed yet"),
             (Dialect::Harmony, "Harmony"),
             (Dialect::Plain, "no tool-call syntax"),
         ] {
@@ -2881,7 +2886,8 @@ mod tests {
             let msg = no_forced_tool_grammar(d, "\"any\"");
             assert!(msg.contains(needle), "{d:?}: {msg:?}");
         }
-        // and the four that can be forced
+        // and the families that can be forced
+        assert!(Dialect::GemmaChannel.tool_syntax().is_some(), "gemma4");
         assert!(Dialect::JsonToolCall.tool_syntax().is_some(), "granite");
         assert!(Dialect::Laguna.tool_syntax().is_some(), "laguna");
         assert!(Dialect::QwenXml.tool_syntax().is_some());

@@ -26,7 +26,8 @@ use crate::gpu_model::gemma4::vision::{Resized, VisionModel, VisionOutput};
 
 pub use crate::encoder::embedding_gemma2::{
     AUDIO_TOKEN, BOA_TOKEN, BOI_TOKEN, DEFAULT_IMAGE_TOKENS, EOA_TOKEN, EOI_TOKEN, IMAGE_TOKEN,
-    IMAGE_TOKEN_BUDGETS, Run, VIDEO_TOKEN, image_target, image_tokens, placeholder_runs,
+    IMAGE_TOKEN_BUDGETS, Run, VIDEO_FRAME_TOKENS, VIDEO_TOKEN, image_target, image_tokens,
+    placeholder_runs,
 };
 
 /// The picture tower plus its resize: plan memory for the two resample axes
@@ -89,6 +90,17 @@ impl ImageTower {
         image_tokens(w, h, self.budget)
     }
 
+    /// The budget a run of `token` resizes to: a video frame's is the video
+    /// processor's own ([`VIDEO_FRAME_TOKENS`]), whatever the endpoint's
+    /// picture budget (HF `EmbeddingGemma2Processor`, Metal agrees).
+    pub fn budget_for(&self, token: u32) -> usize {
+        if token == VIDEO_TOKEN {
+            VIDEO_FRAME_TOKENS
+        } else {
+            self.budget
+        }
+    }
+
     /// Resident weight bytes of the tower.
     pub fn weight_bytes(&self) -> usize {
         self.tower.weight_bytes()
@@ -105,7 +117,19 @@ impl ImageTower {
     /// processor's resize, then the tower from the resized plane where it
     /// lies on the device (the fused tower patchifies it there).
     pub fn encode(&mut self, rgb: &[u8], w: usize, h: usize) -> Result<VisionOutput, GpuError> {
-        let (at, tw, th) = self.resize_on_device(rgb, w, h)?;
+        self.encode_budget(rgb, w, h, self.budget)
+    }
+
+    /// [`Self::encode`] at a soft-token budget of its own (a video frame's).
+    /// The tower is the same; only the resize target moves.
+    pub fn encode_budget(
+        &mut self,
+        rgb: &[u8],
+        w: usize,
+        h: usize,
+        budget: usize,
+    ) -> Result<VisionOutput, GpuError> {
+        let (at, tw, th) = self.resize_on_device(rgb, w, h, budget)?;
         self.tower
             .encode_resized(Resized::Device(&self.stage[at]), tw, th)
     }
@@ -118,7 +142,7 @@ impl ImageTower {
         w: usize,
         h: usize,
     ) -> Result<VisionOutput, GpuError> {
-        let (at, tw, th) = self.resize_on_device(rgb, w, h)?;
+        let (at, tw, th) = self.resize_on_device(rgb, w, h, self.budget)?;
         self.tower
             .encode_resized_unfused(Resized::Device(&self.stage[at]), tw, th)
     }
@@ -130,7 +154,7 @@ impl ImageTower {
         w: usize,
         h: usize,
     ) -> Result<(Vec<u8>, usize, usize), GpuError> {
-        let (at, tw, th) = self.resize_on_device(rgb, w, h)?;
+        let (at, tw, th) = self.resize_on_device(rgb, w, h, self.budget)?;
         Ok((
             self.exec.to_host_u8_len(&self.stage[at], th * tw * 3)?,
             tw,
@@ -146,12 +170,13 @@ impl ImageTower {
         rgb: &[u8],
         w: usize,
         h: usize,
+        budget: usize,
     ) -> Result<(usize, usize, usize), GpuError> {
         let bad = |m: String| GpuError::Driver(m);
         if rgb.len() != w * h * 3 {
             return Err(bad(format!("a {w} x {h} picture with {} bytes", rgb.len())));
         }
-        let (tw, th) = image_target(w, h, self.budget).map_err(bad)?;
+        let (tw, th) = image_target(w, h, budget).map_err(bad)?;
         if w.max(h).max(tw).max(th) > PLAN_MAX {
             return Err(bad(format!(
                 "a {w} x {h} picture (to {tw} x {th}) is past the {PLAN_MAX}-pixel resampler"

@@ -9,7 +9,7 @@ use paddock_models::{
 pub(super) enum Source {
     Gguf(MappedGguf),
     Ternary(MappedGguf, paddock_models::hadamard::HadamardSpec),
-    Mlx(ShardedSafetensors, bool),
+    Mlx(ShardedSafetensors, bool, Geometry),
     Bonsai(ShardedSafetensors, paddock_models::bonsai::BonsaiConfig),
     Splash(paddock_models::splash::Target),
 }
@@ -21,7 +21,7 @@ impl Source {
         if matches!(self, Self::Gguf(m) if m.tensor_info("output.weight").is_none()) {
             return Ok(None);
         }
-        if let Self::Mlx(source, true) = self {
+        if let Self::Mlx(source, true, _) = self {
             if source
                 .names()
                 .any(|n| n.starts_with("language_model.lm_head."))
@@ -39,7 +39,7 @@ impl Source {
         match self {
             Self::Gguf(m) => m.total_len(),
             Self::Ternary(m, _) => m.total_len(),
-            Self::Mlx(m, _) => m.total_len(),
+            Self::Mlx(m, _, _) => m.total_len(),
             Self::Bonsai(m, _) => m.total_len(),
             Self::Splash(m) => m.total_len(),
         }
@@ -58,7 +58,7 @@ impl Source {
                 .map_err(|e| MetalError::Model(e.to_string()))?;
             return splash_weight(device, tensor, name, dims);
         }
-        let Self::Mlx(source, _) = self else {
+        let Self::Mlx(source, tied, geometry) = self else {
             let Self::Gguf(map) = self else {
                 unreachable!()
             };
@@ -96,10 +96,18 @@ impl Source {
         let count = data.len() / 2;
         let buffer = device.alloc(count * 4)?;
         let cmd = device.begin()?;
+        let precise = forward::lighton_reference_math(*geometry, *tied, device);
+        #[cfg(test)]
+        let precise = precise || forward::PRECISE_RECURRENT_FOR_TEST.get();
+        let transform = if name.ends_with("ssm_a") {
+            if precise { 2 } else { 1 }
+        } else {
+            0
+        };
         cmd.dispatch(
             "mlx_small",
             &[&input, &buffer],
-            &[count as u32, u32::from(name.ends_with("ssm_a"))],
+            &[count as u32, transform],
             [count.div_ceil(256), 1, 1],
             256,
         );

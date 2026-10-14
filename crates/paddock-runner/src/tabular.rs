@@ -9,7 +9,7 @@ use axum::{
 };
 use paddock_engine::tabular::{Input, Operation, RecipeOutput, Tabular};
 use paddock_models::kumo::recipe::{Cell, RawTable};
-use paddock_models::kumo::{KumoConfig, Task};
+use paddock_models::kumo::{KumoConfig, Task, ecoc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{path::Path, sync::Arc, time::Instant};
@@ -23,7 +23,7 @@ impl TabularModel {
         let c = &self.service.info().config;
         json!({"tabular_prediction":true,"task":task_name(&c.task),"preprocessing":["prepared","sdm_v1"],
             "max_context_rows":4096,"max_query_rows":1024,"max_columns":500,"max_cells":131072,
-            "max_classes":10,"quantiles":if c.task==Task::Regression {999} else {0},
+            "max_classes":ecoc::MAX_CLASSES,"model_classes":ecoc::MODEL_CLASSES,"quantiles":if c.task==Task::Regression {999} else {0},
             "context_cache":self.service.cache_budget_bytes()>0,"cache_budget_bytes":self.service.cache_budget_bytes(),"ensemble":true,"default_estimators":8,"max_estimators":16,
             "max_cached_contexts":4,"context_idle_ttl_seconds":600,"cache_eviction":"lru"})
     }
@@ -115,6 +115,9 @@ pub struct Request {
     pub targets: Vec<f32>,
     pub query: Vec<Vec<Option<f32>>>,
     pub categorical: Vec<bool>,
+    /// Seeds the ECOC codebook past ten classes (unused at ten or fewer).
+    #[serde(default)]
+    pub seed: u64,
 }
 impl Request {
     fn into_input(self, cfg: &KumoConfig) -> Result<(Input, usize), String> {
@@ -144,35 +147,46 @@ impl Request {
             categorical: self.categorical,
             query_rows,
         };
-        input.table().validate(&cfg.task)?;
         let classes = if cfg.task == Task::Classification {
-            let mut present = [false; 10];
+            // codes past nine go through ECOC (the service validates the
+            // passes' 0-9 tables); here only the codes themselves
+            let mut present = [false; ecoc::MAX_CLASSES];
             for &y in &input.y {
+                if !(0.0..ecoc::MAX_CLASSES as f32).contains(&y) || y.fract() != 0.0 {
+                    return Err(format!(
+                        "classification targets must be integer class codes 0..N-1 (N <= {})",
+                        ecoc::MAX_CLASSES
+                    ));
+                }
                 present[y as usize] = true;
             }
             let n = present.iter().filter(|&&v| v).count();
             if present[..n].iter().any(|&v| !v) {
-                return Err(
-                    "classification targets must be contiguous class codes 0..N-1 (N <= 10)".into(),
-                );
+                return Err(format!(
+                    "classification targets must be contiguous class codes 0..N-1 (N <= {})",
+                    ecoc::MAX_CLASSES
+                ));
             }
             n
         } else {
             0
         };
+        if classes <= ecoc::MODEL_CLASSES {
+            input.table().validate(&cfg.task)?;
+        }
         Ok((input, classes))
     }
 }
 fn err(code: StatusCode, kind: &str, message: impl Into<String>) -> Response {
     (code, Json(paddock_api::ErrorBody::new(kind, message))).into_response()
 }
+/// `classes` past ten: each row holds that many ECOC scores (averaged log
+/// probabilities, softmax-normalized below like logits), not ten logits.
 fn predictions(values: &[f32], task: &Task, classes: usize) -> Value {
     match task {
         Task::Classification => Value::Array(
             values
-                .as_chunks::<10>()
-                .0
-                .iter()
+                .chunks_exact(classes.max(ecoc::MODEL_CLASSES))
                 .map(|all| {
                     let logits = &all[..classes];
                     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -281,6 +295,7 @@ pub async fn handle(
         );
     }
     let cfg = &model.service.info().config;
+    let seed = req.seed;
     let (input, classes) = match req.into_input(cfg) {
         Ok(x) => x,
         Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
@@ -289,7 +304,7 @@ pub async fn handle(
     let query = input.query_rows;
     let cols = input.categorical.len();
     let start = Instant::now();
-    let out = match model.service.predict(input).await {
+    let out = match model.service.predict_classes(input, classes, seed).await {
         Ok(v) => v,
         Err(e) => {
             let status = match &e {
@@ -302,7 +317,12 @@ pub async fn handle(
             return err(status, "tabular_error", e.to_string());
         }
     };
-    if out.values.len() != query * cfg.outputs() || out.values.iter().any(|v| !v.is_finite()) {
+    let width = if classes > ecoc::MODEL_CLASSES {
+        classes
+    } else {
+        cfg.outputs()
+    };
+    if out.values.len() != query * width || out.values.iter().any(|v| !v.is_finite()) {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "tabular_error",

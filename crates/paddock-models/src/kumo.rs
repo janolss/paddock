@@ -3,6 +3,7 @@
 use crate::safetensors::{ShardedSafetensors, StDtype, StError};
 use std::path::Path;
 
+pub mod ecoc;
 pub mod recipe;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

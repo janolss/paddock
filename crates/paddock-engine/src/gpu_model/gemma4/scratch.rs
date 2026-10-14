@@ -110,6 +110,7 @@ pub(crate) fn build(
     let kq_in = n_ff.max(n_embd).max(max_q);
 
     Ok(Scratch {
+        moe_verify: false,
         x: alloc(n_embd)?,
         normed: alloc(n_embd)?,
         q: alloc(max_q)?,

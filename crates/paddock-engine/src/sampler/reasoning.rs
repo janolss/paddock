@@ -25,6 +25,19 @@
 //!   thinking budget already injects, so the reply answers from what it has
 //!   instead of thinking on until max_tokens.
 //!
+//! - a degenerate LOOP inside the block - the reply cycling one span (up to
+//!   [`LOOP_MAX_PERIOD`] tokens a lap), or drawing from a handful of tokens
+//!   over and over - forces the same exit,
+//!   so the reply answers from the reasoning it has instead of spinning to
+//!   max_tokens. Gemma 4 26B under Claude Code, reciting a 217-row ledger
+//!   column from memory, narrowed to two notes and then cycled `standard, `
+//!   for 50K characters. vLLM's reasoning loop break (PR #52677) is the same
+//!   shape - an exact cycle in the reasoning tail flips the request into the
+//!   forced end - and catches the cycle; [`degenerate`] also takes the
+//!   phase before it, where a random draw over two or three items never
+//!   repeats exactly. Measured on 404 Gemma 4 thoughts from that campaign:
+//!   none comes within 2x of either threshold.
+//!
 //! The host draw and the device's stop mask (pack slot 850, launched on the
 //! logits rows right before the sampling kernels) compute both the same way,
 //! so a slot whose backend masks on device keeps its device plans inside the
@@ -53,6 +66,37 @@ pub const MASK_LEAVE: usize = 2;
 /// p_stop >= p_top / 2, in logits after temperature. The kernel's literal is
 /// the same f32.
 const PRESSURE_GAP: f32 = -std::f32::consts::LN_2;
+
+/// Loop breaking: no check before this many picks in the block (vLLM's
+/// default too) - a short thought is never a runaway.
+const LOOP_MIN_PICKS: u32 = 256;
+/// Picks between checks.
+const LOOP_EVERY: u32 = 16;
+/// The diversity check's window and n-gram: a degenerate stretch has fewer
+/// than [`LOOP_MAX_DISTINCT`] distinct 4-grams per position in its last 256
+/// picks. Measured: Gemma 4 thoughts bottom out at 0.225, an honest
+/// enumeration of ten notes at 0.44; a random draw over two notes sits at
+/// 0.04, over three at 0.08, an exact cycle under 0.01.
+const LOOP_WINDOW: usize = 256;
+const LOOP_GRAM: usize = 4;
+const LOOP_MAX_DISTINCT: f32 = 0.10;
+/// The cycle check: a span of at most this many tokens...
+const LOOP_MAX_PERIOD: usize = 2048;
+/// ...repeated back to back at least [`LOOP_MIN_COUNT`] times over at
+/// least this many picks. The longest exact repeat in those thoughts is a
+/// re-quoted 62-token code line, twice; the longest cycle a raw replay fell
+/// into was a ~110-number run of the ledger's weights, ~500 tokens a lap
+/// (diversity-high, so only the cycle check sees it).
+const LOOP_MIN_SPAN: usize = 256;
+const LOOP_MIN_COUNT: usize = 3;
+/// Checks in a row that must find the loop - one is a dip.
+const LOOP_HITS: u8 = 2;
+/// Picks the tail keeps: the longest span the cycle check reads.
+const LOOP_TAIL: usize = {
+    let laps = LOOP_MAX_PERIOD * LOOP_MIN_COUNT;
+    let short = LOOP_MIN_SPAN + LOOP_MAX_PERIOD;
+    if laps > short { laps } else { short }
+};
 
 /// The policy for one request ([`super::SamplingParams::reasoning`]), built
 /// by the runner from the dialect when the rendered prompt opened a think
@@ -136,6 +180,13 @@ pub(super) struct Reasoning {
     forcing: Option<usize>,
     /// the backend masks stops on device: device plans stay open here
     device: bool,
+    /// the block's last [`LOOP_TAIL`] picks, for [`degenerate`]
+    tail: std::collections::VecDeque<u32>,
+    /// consecutive checks that found a loop
+    loop_hits: u8,
+    /// a loop was found inside a device run: the exit is forced from the
+    /// pick after the run (the run's own cut is the masks')
+    loop_pending: bool,
 }
 
 impl Sampler {
@@ -213,9 +264,16 @@ impl Sampler {
     }
 
     /// Commit a drawn pick (host or device) and its row's pressure: a leave
-    /// token ends the block; [`STOP_RUN`] pressure picks within the window
-    /// force the exit from the next pick on.
+    /// token ends the block; [`STOP_RUN`] pressure picks within the window,
+    /// or a loop ([`degenerate`]), force the exit from the next pick on.
     pub fn note_drawn(&mut self, t: u32, pressure: bool) {
+        self.note_pick(t, pressure);
+        self.start_loop_exit();
+    }
+
+    /// [`Self::note_drawn`] with a loop only marked: inside a device run the
+    /// exit waits for the run's end.
+    fn note_pick(&mut self, t: u32, pressure: bool) {
         let (Some(p), Some(r)) = (self.params.reasoning.as_ref(), self.reasoning.as_mut()) else {
             return;
         };
@@ -224,6 +282,27 @@ impl Sampler {
             return;
         }
         r.picks += 1;
+        if !p.exit.is_empty() && r.forcing.is_none() {
+            r.tail.push_back(t);
+            if r.tail.len() > LOOP_TAIL {
+                r.tail.pop_front();
+            }
+            if r.picks >= LOOP_MIN_PICKS && r.picks.is_multiple_of(LOOP_EVERY) && loop_break_on() {
+                match degenerate(r.tail.make_contiguous()) {
+                    Some(why) => {
+                        r.loop_hits += 1;
+                        if r.loop_hits >= LOOP_HITS && !r.loop_pending {
+                            r.loop_pending = true;
+                            tracing::info!(
+                                "reasoning loop: {why} after {} picks in the block - forcing its exit",
+                                r.picks
+                            );
+                        }
+                    }
+                    None => r.loop_hits = 0,
+                }
+            }
+        }
         if !pressure {
             return;
         }
@@ -235,6 +314,17 @@ impl Sampler {
             tracing::debug!(
                 "reasoning-stop: stop pressure on {STOP_RUN} picks in the block - forcing its exit"
             );
+        }
+    }
+
+    /// A loop found by [`Self::note_drawn`] forces the exit from the next
+    /// pick on.
+    fn start_loop_exit(&mut self) {
+        if let Some(r) = self.reasoning.as_mut()
+            && r.loop_pending
+            && r.forcing.is_none()
+        {
+            r.forcing = Some(0);
         }
     }
 
@@ -250,11 +340,14 @@ impl Sampler {
             return last;
         }
         for (r, &t) in picks.iter().enumerate() {
-            self.note_drawn(t, pressure.get(r).copied().unwrap_or(false));
+            self.note_pick(t, pressure.get(r).copied().unwrap_or(false));
             if self.host_reasoning() || !self.in_reasoning() {
                 return r;
             }
         }
+        // a loop does not cut the run: every row was drawn under a mask that
+        // still held, and the families cut from the masks alone
+        self.start_loop_exit();
         last
     }
 }
@@ -320,6 +413,41 @@ fn draw(
     }?;
     sampler.note_drawn(t, press);
     Some(t)
+}
+
+/// Loop breaking is on (PADDOCK_NO_REASONING_LOOP_BREAK turns it off for an
+/// A/B; development builds only).
+fn loop_break_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_REASONING_LOOP_BREAK").is_none())
+}
+
+/// The reply has fallen into a loop: the tail (oldest first) ends in a span
+/// of at most [`LOOP_MAX_PERIOD`] tokens repeated back to back, or its last
+/// [`LOOP_WINDOW`] picks hold too few distinct [`LOOP_GRAM`]-grams. Some(why)
+/// for the log.
+fn degenerate(tail: &[u32]) -> Option<String> {
+    let n = tail.len();
+    // smallest period first; each candidate is read newest-first, so a
+    // period the last pick already contradicts costs one compare
+    for p in 1..=LOOP_MAX_PERIOD.min(n.saturating_sub(1)) {
+        let len = p * LOOP_MIN_COUNT.max(LOOP_MIN_SPAN.div_ceil(p));
+        if len <= n && (n - len + p..n).rev().all(|i| tail[i] == tail[i - p]) {
+            return Some(format!("a {p}-token span repeated over {len} picks"));
+        }
+    }
+    if n >= LOOP_WINDOW {
+        let w = &tail[n - LOOP_WINDOW..];
+        let grams: std::collections::HashSet<&[u32]> = w.windows(LOOP_GRAM).collect();
+        let total = LOOP_WINDOW - LOOP_GRAM + 1;
+        if (grams.len() as f32) < LOOP_MAX_DISTINCT * total as f32 {
+            return Some(format!(
+                "{} distinct {LOOP_GRAM}-grams in its last {LOOP_WINDOW} picks",
+                grams.len()
+            ));
+        }
+    }
+    None
 }
 
 /// One host pick: [`draw`], then the machine advanced on what was picked.
@@ -569,6 +697,109 @@ mod tests {
                 assert_eq!(s.walk_device_run(&picks, &pressure), cut);
             }
         }
+    }
+
+    /// Greedy on a fixed row: the block cycles one token. The first check
+    /// (pick 256) finds it, the second (272) confirms it, and the exit is
+    /// forced from the next pick on.
+    #[test]
+    fn a_cycle_in_the_block_forces_the_exit() {
+        let mut s = policy(0.0, 1);
+        for i in 0..(LOOP_MIN_PICKS + LOOP_EVERY) {
+            assert_eq!(pick(&mut s, -9.0), 1, "pick {i}");
+        }
+        assert_eq!(
+            pick(&mut s, -9.0),
+            5,
+            "the exit starts after the second hit"
+        );
+        assert_eq!(pick(&mut s, -9.0), 6);
+        assert_eq!(pick(&mut s, -9.0), CLOSE);
+        assert!(!s.in_reasoning());
+    }
+
+    /// A row-by-row pick (one token per row, `n` tokens wide) steered by a
+    /// sequence - the policy's host draw on what the sequence says.
+    fn steer(s: &mut Sampler, tok: u32, width: usize) -> u32 {
+        let mut r = vec![-9.0f32; width];
+        r[tok as usize] = 9.0;
+        pick_next(s, &mut r, &[], &mut None, &[EOS]).unwrap()
+    }
+
+    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+        let mut x = seed;
+        move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        }
+    }
+
+    /// No exact cycle, only a random draw over two tokens - the phase before
+    /// the collapse - still forces the exit (diversity under the floor).
+    #[test]
+    fn a_two_token_random_walk_forces_the_exit() {
+        let mut s = policy(0.0, 1);
+        let mut next = xorshift(0x2545f4914f6cdd1d);
+        let mut n = 0;
+        while s.forced_exit().is_none() {
+            let t = if next().is_multiple_of(2) { 1 } else { 2 };
+            assert_eq!(steer(&mut s, t, 8), t);
+            n += 1;
+            assert!(n <= 400, "never forced");
+        }
+        assert_eq!(n, (LOOP_MIN_PICKS + LOOP_EVERY) as usize);
+    }
+
+    /// A long lap the diversity check cannot see - 300 distinct tokens, over
+    /// and over, like the ledger's weight column a raw replay cycled - is the
+    /// cycle check's: three laps (900 picks), then the confirming check.
+    #[test]
+    fn a_long_cycle_forces_the_exit() {
+        let mut s = policy(0.0, 1);
+        let mut n = 0u32;
+        while s.forced_exit().is_none() {
+            let t = 7 + n % 300;
+            assert_eq!(steer(&mut s, t, 310), t);
+            n += 1;
+            assert!(n <= 2000, "never forced");
+        }
+        assert_eq!(
+            n, 928,
+            "first hit at the check after 900, confirmed 16 later"
+        );
+    }
+
+    /// Reasoning over a real vocabulary never trips it: 4000 picks drawn from
+    /// 60 tokens keep nearly every 4-gram distinct.
+    #[test]
+    fn varied_reasoning_never_breaks() {
+        let mut s = policy(0.0, 1);
+        let mut next = xorshift(0x9e3779b97f4a7c15);
+        for _ in 0..4000 {
+            let t = 7 + (next() % 60) as u32;
+            assert_eq!(steer(&mut s, t, 70), t);
+        }
+        assert!(s.in_reasoning() && s.forced_exit().is_none());
+    }
+
+    /// Inside a device run the loop does not cut it (the families cut from
+    /// the masks, and every row was drawn under one that held): the run
+    /// commits whole and the exit starts at the pick after it.
+    #[test]
+    fn a_loop_in_a_device_run_exits_after_the_run() {
+        let mut s = policy(0.0, 1);
+        s.arm_stop_mask(&[EOS]);
+        let mut runs = 0;
+        while s.stop_mask(&[EOS], 0).is_some() {
+            assert_eq!(s.walk_device_run(&[1, 1, 1, 1, 1], &[]), 4, "a whole run");
+            runs += 1;
+            assert!(runs <= 100, "never forced");
+        }
+        assert_eq!(s.forced_exit(), Some(5));
+        // the second hit lands at pick 272 = inside run 55 (picks 271-275)
+        assert_eq!(runs, 55);
     }
 
     /// Without a policy nothing changes.

@@ -1839,6 +1839,63 @@ fn mlx_checkpoint_reference_generations() {
 }
 
 #[test]
+#[ignore = "requires independent MLX gated-normalization capture and pinned checkpoint"]
+fn mlx_gated_norm_reference_arithmetic() {
+    let path = std::env::var("PADDOCK_NEMOTRON_MLX_MODEL").unwrap();
+    let reference = std::env::var("PADDOCK_NEMOTRON_MLX_REFERENCE").unwrap();
+    let model = Nemotron::load(std::path::Path::new(&path), 4096, 1, None).unwrap();
+    let Mixer::Mamba(w) = &model.layers[0].mixer else {
+        unreachable!()
+    };
+    let mut differences = 0;
+    for case in 0..3 {
+        let f = paddock_models::safetensors::SafetensorsFile::open(
+            &std::path::Path::new(&reference).join(format!("case-{case}.safetensors")),
+        )
+        .unwrap();
+        let (_, y) = f.bytes("y").unwrap();
+        let (_, proj) = f.bytes("proj").unwrap();
+        let (_, expected) = f.bytes("yn").unwrap();
+        assert_eq!(y.len(), expected.len());
+        let rows = y.len() / (4096 * 4);
+        assert!(rows > 0);
+        assert_eq!(y.len(), rows * INNER * 4);
+        assert_eq!(proj.len(), rows * PROJECTED * 4);
+        let y = model.device.upload(y).unwrap();
+        let proj = model.device.upload(proj).unwrap();
+        let out = model
+            .device
+            .upload(&vec![0xff; expected.len() + 128])
+            .unwrap();
+        let cmd = model.device.begin().unwrap();
+        cmd.dispatch(
+            "nemo_mlx_gated_norm",
+            &[&y, &proj, &w.norm.buffer, &out],
+            &[1e-5f32.to_bits()],
+            [8, rows, 1],
+            256,
+        );
+        cmd.finish().unwrap();
+        let actual = unsafe { out.read_u32(expected.len() / 4 + 32) };
+        let different = actual
+            .iter()
+            .zip(expected.chunks_exact(4))
+            .filter(|(a, b)| **a != u32::from_le_bytes((*b).try_into().unwrap()))
+            .count();
+        assert!(actual[expected.len() / 4..].iter().all(|&v| v == u32::MAX));
+        eprintln!(
+            "NEMO_GATED_NORM case={case} different={different}/{}",
+            expected.len() / 4
+        );
+        differences += different;
+    }
+    assert_eq!(
+        differences, 0,
+        "gated normalization must match MLX on identical inputs"
+    );
+}
+
+#[test]
 #[ignore = "diagnostic BF16 graph; full generation must match the independent MLX reference"]
 fn mlx_bf16_checkpoint_reference_generations() {
     crate::projection::with_affine_mlx(mlx_checkpoint_reference_generations);

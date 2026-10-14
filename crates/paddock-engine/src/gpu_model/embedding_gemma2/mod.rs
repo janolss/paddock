@@ -397,11 +397,15 @@ impl GpuEmbeddingGemma2 {
             }
             for (run, item) in runs.iter().zip(items) {
                 match (run.token, item) {
-                    (media::IMAGE_TOKEN, MmChunk::Image { w, h, rgb }) => {
+                    (media::IMAGE_TOKEN | media::VIDEO_TOKEN, MmChunk::Image { w, h, rgb }) => {
                         if rgb.len() != w * h * 3 {
                             return Err("a picture's bytes do not match its size".into());
                         }
-                        let want = self.image_tokens(*w, *h)?;
+                        let tower = self
+                            .images
+                            .as_ref()
+                            .ok_or("this endpoint serves no pictures (no mmproj attached)")?;
+                        let want = media::image_tokens(*w, *h, tower.budget_for(run.token))?;
                         if run.len != want {
                             return Err(format!(
                                 "a {w} x {h} picture takes {want} soft tokens, its run has {}",
@@ -434,6 +438,7 @@ impl GpuEmbeddingGemma2 {
                                 | media::EOI_TOKEN
                                 | media::AUDIO_TOKEN
                                 | media::EOA_TOKEN
+                                | media::VIDEO_TOKEN
                         ))
             });
             if !text_ok {

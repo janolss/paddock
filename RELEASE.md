@@ -106,6 +106,3 @@ is built from the same commit.
   different numerics, not a wrong answer.
 
 - On-demand loading covers Whisper only.
-
-- The fp8 KV cache's paged attention on RTX 50-series cards shows a small
-  numeric deviation in one split configuration (#5).

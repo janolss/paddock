@@ -594,19 +594,20 @@ pub(crate) fn mmq_kq_pre(
         exec.kquant_gemv_w4a8_nc(k, xq, xs, needs.then_some(&*ssums), y, r)?;
         return Ok(());
     }
-    // mma from r=3 (was 5): the spec verify runs at r = k+1 = 3..8, and a
-    // kernel A/B has mma_ks at 455-496 GB/s at r=4 vs the dp4a
-    // z-tile's ~300-450 on the same shapes - the old floor left the verify
-    // pass ~60% over one weight read (16.9-18.3 ms measured vs ~10.5).
+    // mma from r=2 (was 3, before that 5): the spec verify runs at r = k+1
+    // = 3..8, and the K-split wins every k-quant plane from r=2 on GB202
+    // (bench/kq_dec_gb202_bench.cu, qkv b=2 63.6 -> 37.1 us; see
+    // `kq_ks_min_batch`), as it did at r=4 on the A6000 (455-496 GB/s vs
+    // the dp4a z-tile's ~300-450).
     static KS_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let ks_min = *KS_MIN.get_or_init(|| {
         paddock_models::dev_var!("PADDOCK_KQ_SPEC_KS_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3)
+            .unwrap_or(2)
     });
     if (ks_min..=64).contains(&r) && part.len() >= 8 * 64 * k.dims[1] && exec.has_kquant_mma_ks() {
-        exec.kquant_gemm_mma_ks(k, xq, xs, needs.then_some(&*ssums), part, y, r)?;
+        exec.kquant_gemm_decode(k, xq, xs, needs.then_some(&*ssums), part, y, r)?;
     } else {
         exec.kquant_gemm_dp4a(k, xq, xs, needs.then_some(&*ssums), y, r)?;
     }

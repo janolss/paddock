@@ -201,9 +201,16 @@ impl CostModel {
 
     /// Elect for one hit. Pure - no state changes; feedback arrives via the
     /// observe calls.
+    /// What re-prefilling `tokens` would cost at the measured prefill rate -
+    /// the price a restore is weighed against, and the time a parked
+    /// restore is worth waiting for (`restore_flow::park_deadline_vs`).
+    pub fn recompute_us(&self, tokens: u32) -> f64 {
+        tokens as f64 / self.prefill_tpus.get().max(1e-9)
+    }
+
     pub fn elect(&self, hit: HitShape) -> Election {
         let restore_us = self.predict_restore_us(hit);
-        let recompute_us = hit.restore_tokens as f64 / self.prefill_tpus.get().max(1e-9);
+        let recompute_us = self.recompute_us(hit.restore_tokens);
         if self.force_restore || restore_us * self.margin < recompute_us {
             Election::Restore {
                 est_us: restore_us,

@@ -4499,8 +4499,8 @@ impl GpuQwen35 {
             let ev_round = m.exec.record_event()?;
             Ok((picks, ev_round))
         });
-        let (picks, ev_round) = round?;
-        self.exec.wait_event(&ev_round)?;
+        let (picks, ev_round) = self.unified_span_settle(round)?;
+        self.unified_span_settle(self.exec.wait_event(&ev_round).map_err(Into::into))?;
         let finished = if launched {
             self.unified_span_finish()?
         } else {

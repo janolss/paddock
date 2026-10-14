@@ -2,6 +2,7 @@
 //! pinned NVIDIA processors (see packs/metal/kumo.NOTICE.md). Random choices
 //! use a versioned portable PRNG, not PyTorch's device-dependent RNG stream.
 use super::Task;
+use super::ecoc;
 use serde::{Deserialize, Serialize};
 
 pub const RECIPE: &str = "sdm_v1";
@@ -386,6 +387,9 @@ pub struct Member {
     pub y: Vec<f32>,
     pub context: Vec<f32>,
     pub categorical: Vec<bool>,
+    /// `[tasks][classes]` when the target has more classes than the model
+    /// has outputs (see `ecoc`); empty otherwise - one task, `y` as is.
+    pub codebook: Vec<Vec<u8>>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Fitted {
@@ -440,7 +444,8 @@ impl Fitted {
             bytes += m.columns.capacity() * size_of::<FittedColumn>()
                 + m.permutation.capacity() * size_of::<usize>()
                 + (m.y.capacity() + m.context.capacity()) * 4
-                + m.categorical.capacity();
+                + m.categorical.capacity()
+                + m.codebook.iter().map(Vec::capacity).sum::<usize>();
             for c in &m.columns {
                 if let Some(v) = &c.column.categories {
                     bytes += cells(v);
@@ -486,8 +491,12 @@ impl Fitted {
                     classes.push(y.clone());
                 }
             }
-            if classes.len() > 10 {
-                return Err("more than ten classes requires ECOC, which is not implemented".into());
+            if classes.len() > ecoc::MAX_CLASSES {
+                return Err(format!(
+                    "classification serves up to {} classes ({} found)",
+                    ecoc::MAX_CLASSES,
+                    classes.len()
+                ));
             }
         }
         let targets = raw
@@ -642,9 +651,18 @@ impl Fitted {
                 y,
                 context: Vec::new(),
                 categorical,
+                codebook: Vec::new(),
             };
             member.context = member.transform(&raw.context);
             members.push(member);
+        }
+        // past ten classes each member draws its own codebook, in member
+        // order - upstream's ECOC sits inside the model call each member makes
+        if classes.len() > ecoc::MODEL_CLASSES {
+            let mut draws = ecoc::Draws::new(seed ^ ecoc::STREAM);
+            for m in &mut members {
+                m.codebook = ecoc::draw(classes.len(), &mut draws);
+            }
         }
         Ok(Self {
             members,
@@ -663,37 +681,56 @@ impl Fitted {
         }
         Ok(())
     }
+    /// Model passes a member makes: one, or one per ECOC task.
+    pub fn tasks(&self) -> usize {
+        self.members[0].codebook.len().max(1)
+    }
+    /// Output values a query row gets back from [`Self::reduce`]: the model's
+    /// ten logits, one score per class past ten, or 999 quantiles.
+    pub fn width(&self, task: &Task) -> usize {
+        match task {
+            Task::Classification => self.classes.len().max(ecoc::MODEL_CLASSES),
+            Task::Regression => 999,
+        }
+    }
     /// Undo label permutations before averaging logits, not probabilities.
     /// Undo target units/sign, sort each member's quantiles, then trim 20%
     /// from each ensemble tail independently at every output coordinate.
+    /// `outputs` holds every member's passes in order - [`Self::tasks`] of
+    /// them a member - and an ECOC member's tasks combine into its class
+    /// scores first, which then average like logits (SDM averages the
+    /// members' ECOC scores the same way).
     pub fn reduce(
         &self,
         outputs: &[Vec<f32>],
         task: &Task,
         query: usize,
     ) -> Result<Vec<f32>, String> {
-        let width = if *task == Task::Classification {
-            10
+        let pass = if *task == Task::Classification {
+            ecoc::MODEL_CLASSES
         } else {
             999
         };
-        if outputs.len() != self.members.len()
+        let width = self.width(task);
+        let tasks = self.tasks();
+        if outputs.len() != self.members.len() * tasks
             || outputs
                 .iter()
-                .any(|v| v.len() != query * width || v.iter().any(|x| !x.is_finite()))
+                .any(|v| v.len() != query * pass || v.iter().any(|x| !x.is_finite()))
         {
             return Err("invalid ensemble output".into());
         }
-        let mut restored = Vec::with_capacity(outputs.len());
-        for (m, v) in self.members.iter().zip(outputs) {
+        let mut restored = Vec::with_capacity(self.members.len());
+        for (m, passes) in self.members.iter().zip(outputs.chunks(tasks)) {
+            let v = if m.codebook.is_empty() {
+                passes[0].clone()
+            } else {
+                let refs: Vec<&[f32]> = passes.iter().map(Vec::as_slice).collect();
+                ecoc::combine(&refs, &m.codebook, query)
+            };
             let mut out = v.clone();
             if *task == Task::Classification {
-                for (source, dest) in v
-                    .as_chunks::<10>()
-                    .0
-                    .iter()
-                    .zip(out.as_chunks_mut::<10>().0)
-                {
+                for (source, dest) in v.chunks_exact(width).zip(out.chunks_exact_mut(width)) {
                     for (c, z) in dest.iter_mut().take(self.classes.len()).enumerate() {
                         *z = source[(c + self.classes.len() - m.label_shift) % self.classes.len()];
                     }
@@ -710,11 +747,11 @@ impl Fitted {
             restored.push(out);
         }
         let cut = if *task == Task::Regression {
-            outputs.len() / 5
+            restored.len() / 5
         } else {
             0
         };
-        let mut work = vec![0.; outputs.len()];
+        let mut work = vec![0.; restored.len()];
         let mut result = vec![0.; query * width];
         for (i, z) in result.iter_mut().enumerate() {
             for (dest, src) in work.iter_mut().zip(&restored) {
@@ -736,6 +773,22 @@ impl Fitted {
     }
 }
 impl Member {
+    /// The context labels of each model pass: `y` itself, or `y` mapped
+    /// through every ECOC task's code (0-8 own, 9 the rest).
+    pub fn task_labels(&self) -> Vec<Vec<f32>> {
+        if self.codebook.is_empty() {
+            return vec![self.y.clone()];
+        }
+        self.codebook
+            .iter()
+            .map(|code| {
+                self.y
+                    .iter()
+                    .map(|&c| f32::from(code[c as usize]))
+                    .collect()
+            })
+            .collect()
+    }
     pub fn transform(&self, rows: &[Vec<Cell>]) -> Vec<f32> {
         rows.iter()
             .flat_map(|r| self.permutation.iter().map(|i| self.columns[*i].apply(r)))

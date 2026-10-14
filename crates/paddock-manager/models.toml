@@ -1071,11 +1071,11 @@ id = "gemma-4-31b"
 vendor = "Google"
 display = "Gemma 4 31B"
 family = "gemma-4"
-# No "tools": paddock cannot parse gemma-4's tool dialect
-# (<|tool_call>call:NAME{...}<tool_call|>) - parsers.rs documents the gap and
-# ToolSyntax has no GemmaChannel arm, so tool_calls comes back null with the
-# raw call text as content. The label returns with the gemma4 tools milestone.
-capability = ["chat", "vision", "reasoning", "speculative"]
+# "tools": gemma-4's tool dialect (<|tool_call>call:NAME{...}<tool_call|>) parses,
+# streams and can be forced (2026-10-13). This file embeds the older Gemma 4
+# template; the runner's tests round-trip calls through it, and the 26B-A4B
+# (the newer template) was verified live on all three APIs.
+capability = ["chat", "vision", "reasoning", "speculative", "tools"]
 license = "gemma"
 revision = "2026-08-01"
 # gemma4 pools its KV at fp8 by default (gpu_model/gemma4/batch.rs alloc_kv),
@@ -1110,7 +1110,10 @@ kv_default = "fp8_e4m3"
   default = true
 
   [model.artifact.shape]
-  weight_bytes = 34117208576
+  # the measured 34117208576 less the raw Q8_0 embedding table a tied file
+  # no longer keeps beside its head (1497366528 B; since 2026-10-13 the row
+  # gathers read the head's repacked plane)
+  weight_bytes = 32619842048
   kind = "generative"
   vocab = 262144
   max_ctx = 262144
@@ -1316,17 +1319,17 @@ kv_default = "fp8_e4m3"
 
 # Gemma 4 26B-A4B (Google's MoE sibling: 128 routed experts, top-8, plus a
 # shared expert - ~4B active per token on a 26B checkpoint). Same family
-# module, template and drafter design as the 31B, so it inherits the same
-# capability caveats (no "tools" until the gemma4 tools milestone). All three
-# capabilities below were live-probed: chat + vision
-# (mmproj described a test image correctly) + speculative (/metrics counted
-# 214 drafted / 208 accepted with the sideloaded drafter).
+# module, template and drafter design as the 31B. All its capabilities were
+# live-probed: chat + vision (mmproj described a test image correctly) +
+# speculative (/metrics counted 214 drafted / 208 accepted with the sideloaded
+# drafter) + tools (2026-10-13: parallel, streamed and forced calls and tool
+# results with pictures, on chat, messages and responses; 27/28 SDK-gate sections).
 [[model]]
 id = "gemma-4-26b-a4b"
 vendor = "Google"
 display = "Gemma 4 26B A4B"
 family = "gemma-4"
-capability = ["chat", "vision", "reasoning", "speculative"]
+capability = ["chat", "vision", "reasoning", "speculative", "tools"]
 license = "gemma"
 revision = "2026-08-13"
 # family default, same as the 31B (gpu_model/gemma4/batch.rs alloc_kv)
@@ -1365,7 +1368,10 @@ kv_default = "fp8_e4m3"
   runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision", "drafter"], note = "Native Metal 26B-A4B Q8, own BF16 tower and shared-KV assistant. At 4K: 29/29 first tokens, 15/16 short text/image streams including MTP; one image formatting mismatch remains. Testing notes: broader generation, performance and exact Metal manager admission are open. Native context 32768/batch 64 are implementation ceilings, not qualified capacities." } } }
 
   [model.artifact.shape]
-  weight_bytes = 27645605376
+  # the measured 27645605376 less the raw Q8_0 embedding table a tied file
+  # no longer keeps beside its head (784334848 B, the drop measured on the
+  # GB10 2026-10-13)
+  weight_bytes = 26861270528
   kind = "generative"
   vocab = 262144
   max_ctx = 262144
@@ -1477,8 +1483,9 @@ kv_default = "fp8_e4m3"
 
   [model.artifact.shape]
   # file bytes + the lane's resident planes (E^T bf16 1,476,395,008 B + the
-  # self-cond MLP), as weights_mem_bytes reports them
-  weight_bytes = 29140980736
+  # self-cond MLP), as weights_mem_bytes reports them; the raw Q8_0 embedding
+  # table (784334848 B) drops once the lane has transposed it (2026-10-13)
+  weight_bytes = 28356645888
   kind = "generative"
   vocab = 262144
   max_ctx = 262144
@@ -5745,7 +5752,7 @@ revision = "2026-10-09"
   default_spec = "off"
   default_max_ctx = 16384
   default_max_batch = 1
-  note = "Native packed affine-4 text and embedded BF16 page reader. Plain OCR and grounding; no speculative drafter. M5 repeated c1/c4 fixture diagnostic: all extracted text matches MLX-VLM 0.7.6; 5/6 complete outputs match, with one grounded page differing in coordinates. Broader accuracy and performance qualification remain open."
+  note = "Native packed affine-4 text and embedded BF16 page reader. Plain OCR and grounding; no speculative drafter. M5 repeated c1/c4 fixture diagnostic: 6/6 complete outputs match MLX-VLM 0.7.6, including grounding coordinates and token accounting; reversed/staggered c4 arrivals also match. Broader accuracy and performance qualification remain open."
 
   [model.artifact.runtime.memory]
   weight_bytes = 3041445888

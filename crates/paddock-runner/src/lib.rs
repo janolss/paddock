@@ -32,6 +32,7 @@ pub mod extract;
 pub mod filters;
 pub mod forced_align;
 pub mod forensics;
+mod gemma_tools;
 pub mod generation_residency;
 pub mod harmony;
 pub mod images;

@@ -44,6 +44,7 @@ pub(crate) mod planes;
 mod prefix;
 mod scratch;
 mod spec;
+mod switches;
 pub mod vision;
 
 use cudarc::driver::CudaSlice;
@@ -66,7 +67,7 @@ pub(crate) struct SpecPipeCfg {
     pub n: usize,
     pub rr: usize,
     pub k_use: usize,
-    pub gkey: (usize, usize, bool, bool, usize),
+    pub gkey: (usize, usize, bool, bool, bool, usize),
 }
 
 /// slot ids for the armed pipe (reqs order) - kept beside the Copy cfg.
@@ -78,7 +79,7 @@ pub(crate) struct SpecPipe {
     pub n: usize,
     pub rr: usize,
     pub k_use: usize,
-    pub gkey: (usize, usize, bool, bool, usize),
+    pub gkey: (usize, usize, bool, bool, bool, usize),
     pub slot_ids: Vec<u32>,
     pub stride: usize,
     /// strip double-buffer half the next round writes
@@ -736,6 +737,11 @@ pub(crate) struct GlobalPaging {
 
 /// Decode-step scratch, allocated once at load for the LARGEST geometry.
 pub(crate) struct Scratch {
+    /// This tick verifies speculative drafts: its rows are consecutive tokens
+    /// of a few sequences, so their routed experts overlap and the sorted
+    /// expert path (each touched expert read once) pays from verify widths
+    /// (g4_moe_tail). Set by the spec verify ticks only.
+    pub moe_verify: bool,
     pub x: CudaSlice<f32>,      // residual stream [n_embd]
     pub normed: CudaSlice<f32>, // pre-attn / pre-ffn norm out [n_embd]
     pub q: CudaSlice<f32>,      // [n_head * 512]
@@ -1059,13 +1065,15 @@ pub struct GpuGemma4 {
     pub(crate) d_slots: Option<CudaSlice<u32>>,
     /// captured decode ticks keyed by (row count, spec chunk k1; k1=1 for
     /// dense) - the spec-verify attention arm bakes k1-deep kernels, so the
-    /// same row count with a different chunking is a different graph
+    /// same row count with a different chunking is a different graph. The
+    /// third bool is `Scratch::moe_verify`: a verify tick may take another
+    /// expert path than a decode tick of the same width.
     pub(crate) decode_graphs:
-        std::collections::HashMap<(usize, usize, bool, bool, usize), SendGraph>,
+        std::collections::HashMap<(usize, usize, bool, bool, bool, usize), SendGraph>,
     /// gkeys sighted once (seen-once lazy capture): first sight
     /// runs the tick eagerly; only a RECURRING gkey pays the ~6.4ms
     /// capture (wave transitions mint one-off row counts)
-    pub(crate) graph_seen: std::collections::HashSet<(usize, usize, bool, bool, usize)>,
+    pub(crate) graph_seen: std::collections::HashSet<(usize, usize, bool, bool, bool, usize)>,
     /// captured PREFILL passes (PADDOCK_PF_CAP): the c32 mixed tick
     /// is [eager forward_prefill_batch] + [captured decode], and the eager
     /// prefill pass's ~hundreds of per-layer launches are the steady-state
@@ -1097,6 +1105,10 @@ pub struct GpuGemma4 {
     /// drafter's h source. Cleared by any pass that overwrites pf_normed
     /// without recording (prefill/unified walks); see spec.rs header.
     pub(crate) spec_rows: Vec<Option<(u32, u32)>>,
+    /// The open host-sampled spec round (`forward_spec_verify` ->
+    /// `spec_commit`): per request (slot, start position, first verify row),
+    /// and the round's row count.
+    pub(crate) spec_host_round: Option<(Vec<(usize, usize, usize)>, usize)>,
     /// Issue-ahead: the mixed round in flight between
     /// forward_mixed_spec_launch and _wait (the service runs the previous
     /// round's deferred finish work between the two).
@@ -1429,6 +1441,18 @@ impl Generator for GpuGemma4 {
         self.forward_spec_rows_impl(reqs, &rows).map_err(gen_err)
     }
 
+    fn forward_spec_verify(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Option<Vec<f32>>, GenError> {
+        self.forward_spec_verify_impl(reqs).map_err(gen_err)
+    }
+
+    fn spec_commit(&mut self, committed: &[u32]) -> Result<(), GenError> {
+        self.spec_commit_impl(committed);
+        Ok(())
+    }
+
     fn spec_draft_batch(
         &mut self,
         pendings: &[(usize, u32)],
@@ -1687,6 +1711,24 @@ impl Generator for GpuGemma4 {
     /// gate is false at every width. The only lane left is the SAMPLED
     /// fallback (it consults neither), which drafts exactly once and then
     /// cools down 256 ticks - the "drafts fine, never verifies" symptom.
+    /// A drafter is resident (the sideloaded assistant or DFlash) - the same
+    /// answer `spec_live_cap` gives. Without it the service warned "CANNOT
+    /// speculate" on every gemma4 serve that drafted perfectly well.
+    /// The MoE checkpoint's verify re-streams every routed expert its rows
+    /// touch, so a deep chain costs more than it returns: depth 3 against the
+    /// ladder's 7 on the 26B-A4B + assistant (GB10, greedy, 2026-10-13) -
+    /// single stream 56.7-64.0 -> 65.7-70.8 tok/s on code and edit prompts,
+    /// four streams 112 -> 120 aggregate, per-position acceptance the same
+    /// as llama.cpp's at its own depth of 3. Dense checkpoints and DFlash
+    /// keep the ladder.
+    fn spec_depth_cap(&self) -> Option<usize> {
+        (self.hp.n_expert > 0 && self.dflash.is_none()).then_some(3)
+    }
+
+    fn spec_capable(&self) -> bool {
+        self.dflash_attached() || self.mtp.is_some()
+    }
+
     fn spec_live_cap(&self) -> usize {
         if self.dflash_attached() {
             // DFlash declines a round wider than this anyway (spec.rs's

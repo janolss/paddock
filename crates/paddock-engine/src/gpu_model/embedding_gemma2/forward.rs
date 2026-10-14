@@ -128,11 +128,13 @@ impl GpuEmbeddingGemma2 {
             for (run, item) in super::media::placeholder_runs(seq).iter().zip(items) {
                 let (embd, n_tokens) = match item {
                     crate::service::MmChunk::Image { rgb, w, h } => {
-                        let o = self
+                        // a video frame is a picture at the frame budget
+                        let tower = self
                             .images
                             .as_mut()
-                            .ok_or(GpuModelError::MissingMeta("no picture tower".into()))?
-                            .encode(rgb, *w, *h)?;
+                            .ok_or(GpuModelError::MissingMeta("no picture tower".into()))?;
+                        let budget = tower.budget_for(run.token);
+                        let o = tower.encode_budget(rgb, *w, *h, budget)?;
                         (o.embd, o.n_tokens)
                     }
                     crate::service::MmChunk::Audio { samples, .. } => {

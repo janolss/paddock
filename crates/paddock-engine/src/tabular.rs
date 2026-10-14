@@ -114,7 +114,12 @@ pub enum Error {
     NotFound,
 }
 enum Job {
-    Prepared(Input, oneshot::Sender<Result<Output, String>>),
+    /// A prepared table, with its ECOC codebook past ten classes.
+    Prepared(
+        Input,
+        Option<Vec<Vec<u8>>>,
+        oneshot::Sender<Result<Output, String>>,
+    ),
     Recipe(Operation, oneshot::Sender<Result<RecipeOutput, Error>>),
 }
 pub enum Operation {
@@ -164,6 +169,36 @@ fn expire<C>(sessions: &mut HashMap<String, Session<C>>) {
     sessions.retain(|_, s| s.last_used.elapsed() < CACHE_TTL);
 }
 
+/// One prepared table past ten classes: a pass per codebook task, batched
+/// like an ensemble's members, combined into class scores.
+fn prepared_ecoc<B: TabularBackend>(
+    backend: &mut B,
+    input: &Input,
+    book: &[Vec<u8>],
+) -> Result<Output, String> {
+    let labels: Vec<Vec<f32>> = book
+        .iter()
+        .map(|code| {
+            input
+                .y
+                .iter()
+                .map(|&c| f32::from(code[c as usize]))
+                .collect()
+        })
+        .collect();
+    let tables: Vec<Table<'_>> = labels
+        .iter()
+        .map(|y| Table { y, ..input.table() })
+        .collect();
+    let outs = backend.predict_many(&tables)?;
+    let refs: Vec<&[f32]> = outs.iter().map(|o| o.values.as_slice()).collect();
+    Ok(Output {
+        values: paddock_models::kumo::ecoc::combine(&refs, book, input.query_rows),
+        gpu_seconds: outs.iter().map(|o| o.gpu_seconds).sum(),
+        workspace_bytes: outs.iter().map(|o| o.workspace_bytes).max().unwrap_or(0),
+    })
+}
+
 fn run_recipe<B: TabularBackend>(
     backend: &mut B,
     sessions: &mut HashMap<String, Session<B::Context>>,
@@ -206,7 +241,12 @@ fn run_recipe<B: TabularBackend>(
                 .iter()
                 .map(|m| m.transform(&query))
                 .collect::<Vec<_>>();
-            let xs = xs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            // one fitted context a model pass: an ECOC member's tasks share
+            // its rows
+            let xs = xs
+                .iter()
+                .flat_map(|x| std::iter::repeat_n(x.as_slice(), f.tasks()))
+                .collect::<Vec<_>>();
             let mut outputs = Vec::new();
             for out in backend
                 .query_many(&session.contexts, &xs, query.len())
@@ -259,7 +299,8 @@ fn run_recipe<B: TabularBackend>(
                 .members
                 .iter()
                 .map(|m| backend.context_bytes(f.context_rows, m.categorical.len()))
-                .sum::<u64>();
+                .sum::<u64>()
+                * f.tasks() as u64;
             let mut bytes = f.resident_bytes() + gpu_bytes;
             if id.is_some() {
                 if backend.cache_budget() == 0 || bytes > backend.cache_budget() {
@@ -293,15 +334,26 @@ fn run_recipe<B: TabularBackend>(
                     x
                 })
                 .collect::<Vec<_>>();
+            // past ten classes a member is one pass per ECOC task: same rows,
+            // the labels mapped through that task's code
+            let labels = f
+                .members
+                .iter()
+                .map(|m| m.task_labels())
+                .collect::<Vec<_>>();
+            let query_rows = query.len();
             let tables = f
                 .members
                 .iter()
                 .zip(&xs)
-                .map(|(member, x)| Table {
-                    x,
-                    y: &member.y,
-                    categorical: &member.categorical,
-                    query_rows: query.len(),
+                .zip(&labels)
+                .flat_map(|((member, x), ys)| {
+                    ys.iter().map(move |y| Table {
+                        x,
+                        y,
+                        categorical: &member.categorical,
+                        query_rows,
+                    })
                 })
                 .collect::<Vec<_>>();
             let (contexts, outs) = if id.is_some() {
@@ -423,12 +475,15 @@ impl Tabular {
                     // revive an expired handle just because its query woke us.
                     expire(&mut sessions);
                     match job {
-                        Job::Prepared(input, reply) => {
+                        Job::Prepared(input, book, reply) => {
                             if reply.is_closed() {
                                 continue;
                             }
                             m.active_slots.store(1, Relaxed);
-                            let out = backend.predict(&input.table());
+                            let out = match book {
+                                None => backend.predict(&input.table()),
+                                Some(book) => prepared_ecoc(&mut backend, &input, &book),
+                            };
                             let _ = reply.send(out);
                         }
                         Job::Recipe(op, reply) => {
@@ -481,7 +536,51 @@ impl Tabular {
             .map_err(Error::Invalid)?;
         let (tx, rx) = oneshot::channel();
         self.tx
-            .try_send(Job::Prepared(input, tx))
+            .try_send(Job::Prepared(input, None, tx))
+            .map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(_) => Error::Busy,
+                std::sync::mpsc::TrySendError::Disconnected(_) => Error::Unavailable,
+            })?;
+        rx.await
+            .map_err(|_| Error::Unavailable)?
+            .map_err(Error::Backend)
+    }
+    /// [`Self::predict`] for a prepared table of `classes` contiguous codes:
+    /// past the model's ten outputs, through a seeded ECOC codebook (see
+    /// `paddock_models::kumo::ecoc`); the output then holds one score per
+    /// class a query row instead of ten logits.
+    pub async fn predict_classes(
+        &self,
+        input: Input,
+        classes: usize,
+        seed: u64,
+    ) -> Result<Output, Error> {
+        use paddock_models::kumo::ecoc;
+        if classes <= ecoc::MODEL_CLASSES {
+            return self.predict(input).await;
+        }
+        if classes > ecoc::MAX_CLASSES {
+            return Err(Error::Invalid(format!(
+                "classification serves up to {} classes",
+                ecoc::MAX_CLASSES
+            )));
+        }
+        let book = ecoc::draw(classes, &mut ecoc::Draws::new(seed ^ ecoc::STREAM));
+        // the passes see task codes 0-9: validate the table as they will
+        let task0: Vec<f32> = input
+            .y
+            .iter()
+            .map(|&c| f32::from(book[0][c as usize]))
+            .collect();
+        Table {
+            y: &task0,
+            ..input.table()
+        }
+        .validate(&self.info.config.task)
+        .map_err(Error::Invalid)?;
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .try_send(Job::Prepared(input, Some(book), tx))
             .map_err(|e| match e {
                 std::sync::mpsc::TrySendError::Full(_) => Error::Busy,
                 std::sync::mpsc::TrySendError::Disconnected(_) => Error::Unavailable,
@@ -733,17 +832,27 @@ mod tests {
             query_rows: 1,
         };
         let (tx, rx) = oneshot::channel();
-        assert!(service.tx.try_send(Job::Prepared(input(), tx)).is_ok());
+        assert!(
+            service
+                .tx
+                .try_send(Job::Prepared(input(), None, tx))
+                .is_ok()
+        );
         wait_start.recv_timeout(Duration::from_secs(30)).unwrap();
         drop(rx); // cancellation during active inference still completes
         for _ in 0..8 {
             let (tx, rx) = oneshot::channel();
             drop(rx);
-            assert!(service.tx.try_send(Job::Prepared(input(), tx)).is_ok());
+            assert!(
+                service
+                    .tx
+                    .try_send(Job::Prepared(input(), None, tx))
+                    .is_ok()
+            );
         }
         let (tx, _rx) = oneshot::channel();
         assert!(matches!(
-            service.tx.try_send(Job::Prepared(input(), tx)),
+            service.tx.try_send(Job::Prepared(input(), None, tx)),
             Err(std::sync::mpsc::TrySendError::Full(_))
         ));
         drop(service);

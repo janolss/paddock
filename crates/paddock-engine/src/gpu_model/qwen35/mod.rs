@@ -39,6 +39,7 @@ mod ops;
 pub mod pictures;
 mod prefix;
 mod rotation;
+mod span;
 mod spec;
 pub mod vision;
 
@@ -248,6 +249,38 @@ fn unified_prefill_rows() -> usize {
             .filter(|&n: &usize| (8..=8192).contains(&n))
             .unwrap_or(UNIFIED_PREFILL_ROWS_DEFAULT)
     })
+}
+
+/// Prefill rows a MIXED unified tick (decode riders aboard) admits, when
+/// set: PADDOCK_UNIFIED_MIXED_ROWS (8..=8192), a latency knob. The decoding
+/// slots wait the whole fused tick, so the span is their token gap during a
+/// neighbour's prefill - 0.8 s at 1024 rows, 1.4 s at the 4096-row span on
+/// Qwen3.8-27B (188 SMs). OFF by default: the W4A8 pass has a large fixed
+/// cost (1024 rows 0.69 s, 4096 rows 1.39 s - measured under nsys), so
+/// capping at 1024 doubles the prefill's pass count for the rider's shorter
+/// gap, a latency trade that costs prefill throughput.
+fn mixed_prefill_rows() -> Option<usize> {
+    static ROWS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        paddock_models::dev_var!("PADDOCK_UNIFIED_MIXED_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| (8..=8192).contains(&n))
+    })
+}
+
+/// The mixed tick's span with `b` decode riders aboard: riders wait a FUSED
+/// tick's whole wall, and on dies with 128+ SMs the unified budget is 4096
+/// rows (load.rs) - a 1.4 s pass on Qwen3.8-27B during which a rider sees
+/// one token (the field's "GPU in one-second beats"). `mixed_prefill_rows`
+/// caps it when the operator asks (see its note for why it is off);
+/// pure-prefill ticks (b == 0) keep the fat span. Riders the overlap
+/// scheduler can take never reach here.
+fn mixed_prefill_cap(base: usize, b: usize) -> usize {
+    match mixed_prefill_rows() {
+        Some(cap) if b > 0 => base.min(cap).max(1),
+        _ => base,
+    }
 }
 
 /// Gated DeltaNet (linear-attention) mixer weights - the 3-of-4 layers.
@@ -2323,17 +2356,23 @@ fn ks_min_batch() -> usize {
 }
 
 /// k-quant K-split crossover: batches above this take `kquant_gemm_mma_ks`
-/// (one weight pass), at or below stay on the dp4a MT tile (one z-pass up to
-/// 16 rows, bandwidth-optimal). 16 = where dp4a starts re-reading weights;
-/// A6000-measured, retune via PADDOCK_KQ_KS_MIN when the shape set changes.
+/// (one weight pass, cp.async ring), at or below stay on the dp4a MT tile.
 /// The batch above which k-quant decode planes ride the pipelined K-split
 /// MMA (`kquant_gemm_mma_ks`) instead of the dp4a MT tile. Die-aware, and
 /// the number is a measurement, not a preference:
 ///
-/// - Big dies (>= 128 SMs): 16, from the rung the doctrine records - the
-///   K-split took every qwen shape from B=24 on the 188-SM die, and B <= 16
-///   was left on the dp4a tile. B <= 16 was never A/B'd there; the small-die
-///   result below says it should be.
+/// - Big dies (>= 128 SMs): 1 since 2026-10-14 (was 16, "never A/B'd there").
+///   Measured cold on GB202 at Qwen3.8-27B's Q5_K planes
+///   (bench/kq_dec_gb202_bench.cu, us a launch, dp4a -> ks): qkv [5120 ->
+///   10240] b=2 63.6 -> 37.1, b=4 61.1 -> 37.5, b=8 70.6 -> 38.5; down
+///   [17408 -> 5120] b=2 73.3 -> 69.2, b=4 79.6 -> 62.0, b=8 91.8 -> 70.1;
+///   up [5120 -> 17408] b=2 48.9 -> 55.9 (the one dp4a win), b=4 55.9 ->
+///   55.9, b=8 69.2 -> 57.4; IQ4_XS gate b=4 47.6 -> 46.7, b=8 60.9 -> 45.5.
+///   Per layer the K-split wins from b=2 and the serve's verify ticks run
+///   at b = slots x (k+1) = 4..8, where dp4a sat at 33-57% of the DRAM
+///   roof and the dp4a z-tile's per-chunk synchronous staging exposes a
+///   DRAM latency a chunk (ncu: long-scoreboard 10.6 an issue, 3 CTAs/SM
+///   at 75 registers). b=1 stays the GEMV.
 /// - Small dies (< 128 SMs): 1. On the 36-SM RTX 5060 Ti (Qwen3.5-9B
 ///   UD-Q4_K_XL, 2026-09-06) the dp4a tile held 84% of the width-8 tick at
 ///   ~207 GB/s of a 448 GB/s card - it stages activations synchronously per
@@ -2350,14 +2389,14 @@ fn ks_min_batch() -> usize {
 /// code, not in an env default: `dev_var!` is a development instrument and a
 /// hardened build must land on the same arm. `PADDOCK_KQ_KS_MIN` overrides
 /// in dev builds (the A/B surface).
-fn kq_ks_min_batch(sm_count: usize) -> usize {
+fn kq_ks_min_batch(_sm_count: usize) -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         paddock_models::dev_var!("PADDOCK_KQ_KS_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(if sm_count < 128 { 1 } else { 16 })
+            .unwrap_or(1)
     })
 }
 

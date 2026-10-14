@@ -1,5 +1,5 @@
-Paddock - Windows x64
-=====================
+Paddock
+=======
 
 A low-latency, high-throughput serving engine for open-source language models,
 running on your own NVIDIA hardware.
@@ -8,7 +8,8 @@ Start here
 ----------
 
   1. Unzip this folder anywhere you like - it is fully portable.
-  2. Run paddock.exe (add --host 0.0.0.0 if you want to bind to your non localhost)
+  2. Run paddock (paddock.exe on Windows; add --host 0.0.0.0 if you want to
+     bind to your non localhost)
   3. Open https://localhost:11500
 
 That is the Studio: download models, start them, chat with them, and watch what
@@ -40,7 +41,9 @@ sits between your requests and the GPU.
 What you need
 -------------
 
-  Windows 10/11 x64, an NVIDIA GPU, and NVIDIA driver 580 or newer.
+  An NVIDIA GPU and NVIDIA driver 580 or newer, on Windows 10/11 x64, on Linux
+  x64 with glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+), or on a DGX Spark
+  with DGX OS 7 (the aarch64 Linux build).
 
 580 is a hard floor, not a recommendation: paddock is built against the CUDA
 13.0 driver API, and an older driver refuses to load it. Any driver from the
@@ -48,27 +51,28 @@ What you need
 display driver.
 
 Nothing else. No Python, no CUDA toolkit, no Visual C++ redistributable - the
-kernels are compiled into paddock-runner.exe, and both binaries link the C
+kernels are compiled into paddock-runner, and both binaries link the C
 runtime statically, so there is no redistributable to install.
 
 Supported GPUs - and "supported" here means measured on that die, not merely
 compiled for:
 
   Blackwell   RTX PRO 6000 / 5000 / 4500 / 4000 / 2000,
-              GeForce RTX 5090 through 5050, B200 / GB200
-  Ampere      RTX A6000 / A5000 / A4000 / A2000, A40 / A10,
-              GeForce RTX 3090 / 3080
+              GeForce RTX 5090 through 5050, B200 / GB200,
+              DGX Spark (GB10, in the aarch64 Linux build)
+  Ampere      RTX A6000 / A5000 / A4000 / A3000 / A2000, A40 / A16 / A10 / A2,
+              GeForce RTX 3090 Ti through 3050
 
-Ada Lovelace (RTX 40-series, RTX 6000 Ada, L40S) is not validated yet. The
-kernels for it ARE in this build and it will very likely run, but its bring-up
-is unfinished, so paddock refuses rather than serve numbers nobody has checked.
-Set PADDOCK_UNVALIDATED_ARCH=1 to try it anyway; those runs are stamped
-UNVALIDATED in the logs.
+Ada Lovelace (RTX 40-series, RTX 6000 Ada, L4 / L40 / L40S) is not validated
+yet. Its kernels ARE in the x64 builds and it will very likely run, so paddock
+serves on it, with a warning at startup that names the card UNVALIDATED - a
+number measured there is never mistaken for a supported result. There is
+nothing to switch on.
 
-Hopper (H100, H200, GH200) is not in this build at all - no kernels ship for
-it, so the override above will not help. Anything older than Ampere will not
-work at all.
-
+Hopper (H100, H200, GH200) and the data-center Ampere parts (A100, A30) are not
+in this build at all - no kernels ship for them, and paddock refuses them at
+startup rather than fall back to something slow. Anything older than Ampere
+will not work at all.
 
 Using it from your own code
 ---------------------------

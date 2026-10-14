@@ -1920,6 +1920,8 @@ static const KernelTableV1 PD_KERNELS = {
     pd_dl_ref_step,
     pd_dl_order_votes,
     pd_stop_mask_rows,
+    pd_kquant_gemm_w4a8_pipe4,
+    pd_kquant_gemm_w4a8_sb,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

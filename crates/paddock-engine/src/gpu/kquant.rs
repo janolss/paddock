@@ -784,10 +784,34 @@ impl GpuExecutor {
         self.kernels.kquant_gemm_w4a8_pipe3.is_some()
     }
 
-    /// The >64-row W4A8 tile, best rung the pack carries: pipe3 (Q4_K, its
-    /// activations on the ring) > pipe2 > pipe > v1. Every rung writes the
-    /// same bytes, so the election is pure speed; PADDOCK_NO_KQUANT_PIPE3 /
-    /// _PIPE2 / _PIPE step it down for an A/B.
+    /// Slot 851: the k-quant tile with no unpacked weight tile (ldmatrix off
+    /// the raw strips, register unpack, activations on the ring for every
+    /// type) - byte-identical to [`Self::kquant_gemm_w4a8_pipe2`], which the
+    /// pack hands the i-quant family to, so it stands in wherever pipe2 does.
+    pub fn kquant_gemm_w4a8_pipe4(
+        &self,
+        w: &RepackedKQ,
+        yq: &CudaSlice<u8>,
+        xsums: Option<&CudaSlice<f32>>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_gemm_w4a8_pipe4
+            .ok_or(GpuError::MissingOp("kquant_gemm_w4a8_pipe4"))?;
+        self.kq_w4a8_rows_with(f, w, yq, xsums, y, 0, batch)
+    }
+
+    pub fn has_kquant_gemm_w4a8_pipe4(&self) -> bool {
+        self.kernels.kquant_gemm_w4a8_pipe4.is_some()
+    }
+
+    /// The >64-row W4A8 tile, best rung the pack carries: pipe4 (no unpacked
+    /// weight tile, every k-quant type) > pipe3 (Q4_K, its activations on the
+    /// ring) > pipe2 > pipe > v1. Every rung writes the same bytes, so the
+    /// election is pure speed; PADDOCK_NO_KQUANT_PIPE4 / _PIPE3 / _PIPE2 /
+    /// _PIPE step it down for an A/B.
     pub fn kquant_gemm_w4a8_tile(
         &self,
         w: &RepackedKQ,
@@ -796,7 +820,11 @@ impl GpuExecutor {
         y: &mut CudaSlice<f32>,
         batch: usize,
     ) -> Result<(), GpuError> {
-        if self.has_kquant_gemm_w4a8_pipe3()
+        if self.has_kquant_gemm_w4a8_pipe4()
+            && paddock_models::dev_var_os!("PADDOCK_NO_KQUANT_PIPE4").is_none()
+        {
+            self.kquant_gemm_w4a8_pipe4(w, yq, xsums, y, batch)
+        } else if self.has_kquant_gemm_w4a8_pipe3()
             && paddock_models::dev_var_os!("PADDOCK_NO_KQUANT_PIPE3").is_none()
         {
             self.kquant_gemm_w4a8_pipe3(w, yq, xsums, y, batch)
@@ -955,6 +983,72 @@ impl GpuExecutor {
             .kernels
             .kquant_gemm_mma_ks
             .ok_or(GpuError::MissingOp("kquant_gemm_mma_ks"))?;
+        self.kq_ks_with(f, w, xq, xs, xsums, part, y, batch)
+    }
+
+    /// Slot 852: the small-batch (b <= 8) decode GEMM - 16-row tiles, each
+    /// warp streaming its own K slice straight into mma fragments; the pack
+    /// hands b > 8 and the i-quant family to `kquant_gemm_mma_ks`. Same
+    /// `part` contract as ks. Reorder-equal to ks / dp4a (the decode class).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_gemm_w4a8_sb(
+        &self,
+        w: &RepackedKQ,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        part: &mut CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_gemm_w4a8_sb
+            .ok_or(GpuError::MissingOp("kquant_gemm_w4a8_sb"))?;
+        self.kq_ks_with(f, w, xq, xs, xsums, part, y, batch)
+    }
+
+    pub fn has_kquant_gemm_w4a8_sb(&self) -> bool {
+        self.kernels.kquant_gemm_w4a8_sb.is_some()
+    }
+
+    /// The k-quant decode-batch GEMM (b >= 2, one weight pass): the
+    /// small-batch rung for b <= 8 when the pack carries it (the pack hands
+    /// wider batches on anyway; b = 9..16 measured slower there), else the
+    /// K-split mma. PADDOCK_NO_KQUANT_SB steps it down for an A/B.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_gemm_decode(
+        &self,
+        w: &RepackedKQ,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        part: &mut CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        if batch <= 8
+            && self.has_kquant_gemm_w4a8_sb()
+            && paddock_models::dev_var_os!("PADDOCK_NO_KQUANT_SB").is_none()
+        {
+            self.kquant_gemm_w4a8_sb(w, xq, xs, xsums, part, y, batch)
+        } else {
+            self.kquant_gemm_mma_ks(w, xq, xs, xsums, part, y, batch)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kq_ks_with(
+        &self,
+        f: paddock_kernels::abi::KquantGemmMmaKsFn,
+        w: &RepackedKQ,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        part: &mut CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
         let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
         debug_assert!(y.len() >= out_dim * batch);

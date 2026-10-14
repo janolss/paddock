@@ -101,6 +101,7 @@ fn small_admission_control(tiny_only: bool) {
                         rows,
                         &scratch,
                         &[(0, rows, 512)],
+                        false,
                     );
                 } else {
                     affine::project(&cmd, &[(&weight, &output)], &input, rows, &scratch);

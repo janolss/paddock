@@ -159,6 +159,16 @@ pub enum ToolSyntax {
     /// declared types. Same decision function as laguna, terminator
     /// `</param>`.
     MiniCpmXml,
+    /// Gemma 4: `<|tool_call>call:NAME{key:value,...}<tool_call|>`, every
+    /// marker a special token (`<|"|>` delimits strings).
+    ///
+    /// The name rides bare after `call:` and the arguments open with `{`,
+    /// which no tool name may contain, so `call:get{` vs `call:get_weather{`
+    /// is prefix-free. The arguments are the template's own value syntax,
+    /// not JSON - nothing about them is typed here, qwen's level: free text to
+    /// the closing `<tool_call|>`, which `gemma_tools` reads back (and refuses
+    /// as a call when it does not parse).
+    GemmaCall,
 }
 
 /// Compiled tool set for `tool_choice: "required"` / named function. One call
@@ -296,6 +306,12 @@ impl ToolSet {
                     None
                 }
                 ToolSyntax::Json => Some(compile_tool_args(f.get("parameters"))),
+                ToolSyntax::GemmaCall => {
+                    if name.contains('{') || name.contains(char::is_whitespace) {
+                        return Err(format!("tool name {name:?} contains grammar bytes"));
+                    }
+                    None
+                }
             };
             fns.push(ToolFn {
                 name: name.to_owned(),
@@ -357,6 +373,11 @@ const MINICPM_PARAM_END: &[u8] = b"</param>";
 /// MiniCPM5's opener through the quote that starts the tool name - the arming
 /// tag for its dispatcher and the prefix of every candidate literal.
 const MINICPM_OPEN: &[u8] = b"<function name=\"";
+/// gemma4's call opener through `call:`, so the name lands inside the
+/// constrained region (the trigger is the bare `<|tool_call>`)
+const GEMMA_OPEN: &[u8] = b"<|tool_call>call:";
+const GEMMA_TRIGGER: &[u8] = b"<|tool_call>";
+const GEMMA_CALL_END: &[u8] = b"<tool_call|>";
 /// muse's `render_atem` writes `'</atem:parameter>\n'` after every value, and
 /// `muse::parse` cuts the value at the tag - so the newline belongs to the
 /// SEPARATOR, not the value, and is spelled here rather than left optional.
@@ -489,6 +510,9 @@ enum TNext {
     /// same, entered through the UNWRAPPED opener - identical but for the
     /// tail, which has no `</tool_call>` to close
     JsonArgsBare(usize),
+    /// gemma4: the name and the opening brace matched - free text to the
+    /// closing `<tool_call|>`
+    GemmaArgs,
     /// closing sequence fully matched
     Finish,
 }
@@ -551,6 +575,12 @@ impl ToolMachine {
                     lit.extend_from_slice(f.name.as_bytes());
                     lit.extend_from_slice(b"\">");
                     cands.push((lit, TNext::Boundary(i, 0)));
+                }
+                ToolSyntax::GemmaCall => {
+                    let mut lit = GEMMA_OPEN.to_vec();
+                    lit.extend_from_slice(f.name.as_bytes());
+                    lit.push(b'{');
+                    cands.push((lit, TNext::GemmaArgs));
                 }
             }
         }
@@ -638,6 +668,11 @@ impl ToolMachine {
                 next: TNext::AtemHead,
             },
             TNext::AtemHead => Self::choice(atem_heads(&self.set, false)),
+            TNext::GemmaArgs => TState::FreeUntil {
+                term: GEMMA_CALL_END,
+                kmp: 0,
+                next: TNext::Finish,
+            },
             TNext::Finish => TState::Done,
         }
     }
@@ -747,7 +782,9 @@ impl ToolMachine {
                     cands.push((b"</function>".to_vec(), TNext::Finish));
                 }
             }
-            ToolSyntax::Json => unreachable!("the json syntax has no parameter boundary"),
+            ToolSyntax::Json | ToolSyntax::GemmaCall => {
+                unreachable!("the json and gemma4 syntaxes have no parameter boundary")
+            }
         }
         Self::choice(cands)
     }
@@ -967,6 +1004,7 @@ impl ToolSyntax {
             // name="`, so the opener arms through the quote and the name lands
             // inside the constrained region, as with muse
             ToolSyntax::MiniCpmXml => MINICPM_OPEN,
+            ToolSyntax::GemmaCall => GEMMA_TRIGGER,
         }
     }
 
@@ -2195,6 +2233,80 @@ mod tests {
             "<function name=\"get_weather\"><param name=\"city\">Berlin</param></function>"
         ));
         assert!(!m.in_call() && m.may_stop());
+    }
+
+    // ------------------------------------------------------------ gemma4 --
+
+    fn gemma_set() -> Arc<ToolSet> {
+        ToolSet::compile(ToolSyntax::GemmaCall, &[laguna_tool()], None).expect("compile tools")
+    }
+
+    /// What the template writes for a call (its special tokens spelled as their
+    /// text): the forced machine walks it to the end and allows nothing after;
+    /// only a declared name opens.
+    #[test]
+    fn gemma_tool_grammar_matches_the_template_shape() {
+        let mut m = ToolMachine::new(gemma_set());
+        assert!(tool_feed(
+            &mut m,
+            "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3}<tool_call|>"
+        ));
+        assert!(m.may_stop());
+        assert!(!m.feed(b'x'), "nothing after the call");
+        assert!(!tool_feed(
+            &mut ToolMachine::new(gemma_set()),
+            "<|tool_call>call:get_time{"
+        ));
+    }
+
+    /// `get` vs `get_weather`: the `{` after the name keeps the candidate set
+    /// prefix-free, and a name holding one is refused.
+    #[test]
+    fn gemma_tool_grammar_disambiguates_prefix_named_functions() {
+        let get = serde_json::json!({"type": "function", "function": {
+            "name": "get", "parameters": {"type": "object", "properties": {}}}});
+        let set =
+            ToolSet::compile(ToolSyntax::GemmaCall, &[get, laguna_tool()], None).expect("compile");
+        for name in ["get", "get_weather"] {
+            let mut m = ToolMachine::new(set.clone());
+            assert!(
+                tool_feed(&mut m, &format!("<|tool_call>call:{name}{{}}<tool_call|>")),
+                "{name}"
+            );
+            assert!(m.may_stop(), "{name}");
+        }
+        let bad = serde_json::json!({"type": "function", "function": {"name": "a{b"}});
+        assert!(ToolSet::compile(ToolSyntax::GemmaCall, &[bad], None).is_err());
+    }
+
+    /// What the machine lets through is what the parser reads back.
+    #[test]
+    fn gemma_tool_grammar_output_round_trips_through_the_parser() {
+        let text = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3}<tool_call|>";
+        assert!(tool_feed(&mut ToolMachine::new(gemma_set()), text));
+        let tools = [laguna_tool()];
+        let hints = crate::parsers::tool_hints(Some(&tools[..])).unwrap();
+        let p = crate::parsers::parse(
+            crate::parsers::Dialect::GemmaChannel,
+            text,
+            false,
+            Some(&hints),
+        );
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&p.tool_calls[0].arguments).unwrap(),
+            serde_json::json!({"city": "Paris", "days": 3})
+        );
+    }
+
+    #[test]
+    fn gemma_dispatch_arms_on_the_opener_and_releases_after_the_call() {
+        let mut m = DispatchMachine::new(gemma_set(), false);
+        assert!(dfeed(&mut m, "Let me check.<|tool_call>call:get_weather{"));
+        assert!(m.in_call());
+        assert!(dfeed(&mut m, "city:<|\"|>Paris<|\"|>}<tool_call|>"));
+        assert!(!m.in_call());
+        assert!(m.may_stop());
     }
 
     // ---------------------------------------------------- dispatch --

@@ -30,6 +30,10 @@ mod commit;
 mod dump;
 use commit::{commit_device_token, sample_slot_row, send_stop_masks, send_verify_masks};
 mod finish;
+mod overlap_gate;
+use overlap_gate::pipe_min_live;
+#[cfg(test)]
+mod scheduler_tests;
 mod timing;
 pub use finish::{FinishReason, next_event};
 
@@ -2970,6 +2974,26 @@ fn finish_prefill_any(
     }
 }
 
+/// Drop the failed slots' chunked prefills in the backend too, then forget
+/// them here. Clearing only our set left the backend's queue holding them:
+/// every later prefill_begin on those slots refused with "slot already has a
+/// chunked prefill in flight", so one bad prompt poisoned the slot for the
+/// server's lifetime (seen 2026-09-06 on a dense i-quant file whose >64-row
+/// GEMM was refused).
+fn abort_backend_chunks(
+    generator: &mut dyn Generator,
+    chunking: &mut std::collections::HashSet<usize>,
+) {
+    for &k in chunking.iter() {
+        if !generator.prefill_abort(k) {
+            tracing::warn!(
+                "serve: slot {k}: backend kept its chunked prefill after the failed tick"
+            );
+        }
+    }
+    chunking.clear();
+}
+
 /// G4b mixed-tick preemption: a mixed (chunked-prefill + decode) pass couldn't
 /// grow the budget pool. Preempt the NEWEST active DECODE slot - never a
 /// chunking slot, whose prefill is making progress - so the retried tick fits
@@ -2980,6 +3004,7 @@ fn finish_prefill_any(
 /// watermark-should-prevent pathological case), fail the stuck chunking slots so
 /// the server recovers instead of spinning.
 fn preempt_or_fail_mixed(
+    generator: &mut dyn Generator,
     slots: &mut [Option<Slot>],
     preempted: &mut Vec<Slot>,
     chunking: &mut std::collections::HashSet<usize>,
@@ -3011,8 +3036,8 @@ fn preempt_or_fail_mixed(
                         "the KV cache pool is exhausted under the current load; retry shortly",
                     )));
                 }
-                chunking.remove(&k);
             }
+            abort_backend_chunks(generator, chunking);
         }
     }
 }
@@ -3220,33 +3245,6 @@ mod cohort_grace_tests {
             Duration::from_micros(350)
         );
     }
-}
-
-/// Live-REQUEST floor (slots holding a request, chunking or decoding) for
-/// the two side-stream decode paths - the OVERLAP block (span-only prefill
-/// ticks on the main lane, decoders pumped on the pipe lane) and the
-/// classic pure-decode pipe. Below it the decode rows ride the unified
-/// prefill pass and ticks run one at a time. 0 = the paths engage at any
-/// width (the 188-SM die, where both were measured to win). The qwen35
-/// default stack sets 9 on dies under 128 SMs: on GB10 (LPDDR5X, 48 SMs) a
-/// decode tick is ~100 ms of weight streaming, so at 8 slots the two lanes
-/// just time-slice the same bandwidth - 1024x1024 c8 TTFT p50 2698 -> 2124
-/// ms and 128x128 c1 223 -> 136 ms with the paths off, throughput flat or
-/// up - while from 16 concurrent up the overlap wins the long cohort
-/// (1024x1024 c16 128.9 vs 126 tok/s, TTFT p50 7.3 vs 10 s; c32 205 vs
-/// 199-202, 12.4 vs 14-16 s). It is counted in requests, not decoders: the
-/// cohort's loss is in its EARLY ticks, so gating on decoders (a floor of
-/// 9 or 16 decoders) still lost c16/c32 - the overlap has to own the cohort
-/// from its first decoder, which a request count gives. PADDOCK_PIPE_MIN_LIVE
-/// overrides.
-fn pipe_min_live() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PADDOCK_PIPE_MIN_LIVE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
 }
 
 fn overlap_admit_max() -> usize {
@@ -4661,8 +4659,7 @@ fn run_batched(
                 });
             // requests in flight (chunking + decoding) - the pipe_min_live floor
             let live_slots = slots.iter().filter(|s| s.is_some()).count();
-            let overlap_ok = unified_ok
-                && !spec_mixed_first
+            let overlap_core = unified_ok
                 && generator.supports_overlap()
                 && !dec.is_empty()
                 && live_slots >= pipe_min_live()
@@ -4677,6 +4674,20 @@ fn run_batched(
                 && generator
                     .pool_free_blocks()
                     .is_none_or(|f| f > max_batch + POOL_WATERMARK_BLOCKS);
+            let spec_mixed_first =
+                overlap_gate::spec_first_after_overlap(spec_mixed_first, overlap_core);
+            let overlap_ok = overlap_core && !spec_mixed_first;
+            if !overlap_ok && !dec.is_empty() && !chunking.is_empty() {
+                overlap_gate::log_fused_mixed_tick(
+                    &dec,
+                    &slots,
+                    &*generator,
+                    unified_ok,
+                    spec_mixed_first,
+                    live_slots,
+                    trunc_pipe_ok,
+                );
+            }
             if overlap_ok {
                 // finisher plans: same peek rules as the fused tick below
                 // (finishers sample in the span's own buffers - TruncCat is
@@ -4711,6 +4722,7 @@ fn run_batched(
                     Ok(l) => l,
                     Err(crate::generator::GenError::PoolExhausted) => {
                         preempt_or_fail_mixed(
+                            generator,
                             &mut slots,
                             &mut preempted,
                             &mut chunking,
@@ -4725,7 +4737,7 @@ fn run_batched(
                                 let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
                             }
                         }
-                        chunking.clear();
+                        abort_backend_chunks(generator, &mut chunking);
                         continue;
                     }
                 };
@@ -4782,6 +4794,13 @@ fn run_batched(
                                 .any(|&p| p as usize + ovl_ticks + 3 >= generator.max_context());
                             if generator.unified_span_done() || low_headroom || all_dead || near_end
                             {
+                                overlap_gate::log_pipe_exit(
+                                    &*generator,
+                                    ovl_ticks,
+                                    low_headroom,
+                                    all_dead,
+                                    near_end,
+                                );
                                 break;
                             }
                             let mut host_row = false;
@@ -4903,6 +4922,7 @@ fn run_batched(
                         }
                         Err(crate::generator::GenError::PoolExhausted) => {
                             preempt_or_fail_mixed(
+                                generator,
                                 &mut slots,
                                 &mut preempted,
                                 &mut chunking,
@@ -4917,7 +4937,7 @@ fn run_batched(
                                         s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
                                 }
                             }
-                            chunking.clear();
+                            abort_backend_chunks(generator, &mut chunking);
                         }
                     }
                 }
@@ -5357,6 +5377,7 @@ fn run_batched(
                                 chunking.remove(&k);
                             }
                             preempt_or_fail_mixed(
+                                generator,
                                 &mut slots,
                                 &mut preempted,
                                 &mut chunking,
@@ -5382,7 +5403,7 @@ fn run_batched(
                                         .send(TokenEvent::Error(EngineError::from_gen(&e)));
                                 }
                             }
-                            chunking.clear();
+                            abort_backend_chunks(generator, &mut chunking);
                             continue;
                         }
                     }
@@ -5584,6 +5605,7 @@ fn run_batched(
                     }
                     Err(crate::generator::GenError::PoolExhausted) => {
                         preempt_or_fail_mixed(
+                            generator,
                             &mut slots,
                             &mut preempted,
                             &mut chunking,
@@ -5601,21 +5623,7 @@ fn run_batched(
                                 let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
                             }
                         }
-                        // The backend still holds the failed chunked prefills
-                        // in its own queue; clearing only our set left every
-                        // later prefill_begin on those slots refusing with
-                        // "slot already has a chunked prefill in flight" -
-                        // one bad prompt poisoned the slot for the server's
-                        // lifetime (seen 2026-09-06 on a dense i-quant file
-                        // whose >64-row GEMM was refused). Drop them there too.
-                        for &k in chunking.iter() {
-                            if !generator.prefill_abort(k) {
-                                tracing::warn!(
-                                    "serve: slot {k}: backend kept its chunked prefill after the failed tick"
-                                );
-                            }
-                        }
-                        chunking.clear();
+                        abort_backend_chunks(generator, &mut chunking);
                     }
                 }
                 st[1].0 += 1;
@@ -5684,7 +5692,13 @@ fn run_batched(
                     }
                 }
                 Err(crate::generator::GenError::PoolExhausted) => {
-                    preempt_or_fail_mixed(&mut slots, &mut preempted, &mut chunking, pool_stats);
+                    preempt_or_fail_mixed(
+                        generator,
+                        &mut slots,
+                        &mut preempted,
+                        &mut chunking,
+                        pool_stats,
+                    );
                 }
                 Err(e) => {
                     // A mixed-pass failure may have half-advanced KV for the
@@ -5700,10 +5714,7 @@ fn run_batched(
                             let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
                         }
                     }
-                    for &k in chunking.iter() {
-                        generator.prefill_abort(k);
-                    }
-                    chunking.clear();
+                    abort_backend_chunks(generator, &mut chunking);
                 }
             }
             // Phase marks for the straggler self-report: this arm returns
@@ -7340,91 +7351,6 @@ fn sample_threads() -> usize {
             .filter(|&n| n >= 1)
             .unwrap_or(12)
     })
-}
-
-#[cfg(test)]
-mod cache_admission_tests {
-    use super::*;
-
-    struct CachedPool {
-        waves: Vec<usize>,
-        reclaimable: usize,
-    }
-    impl Generator for CachedPool {
-        fn reset(&mut self) {}
-        fn vocab(&self) -> usize {
-            2
-        }
-        fn forward(&mut self, _: u32) -> Result<Vec<f32>, GenError> {
-            Ok(vec![0., 1.])
-        }
-        fn pool_free_blocks(&self) -> Option<usize> {
-            Some(0)
-        }
-        fn pool_admission_blocks(&self) -> Option<usize> {
-            Some(self.reclaimable)
-        }
-        fn forward_prefill_batch(
-            &mut self,
-            items: &[(usize, Vec<u32>)],
-        ) -> Result<Vec<Vec<f32>>, GenError> {
-            self.waves.push(items.len());
-            Ok(items.iter().map(|_| vec![0., 1.]).collect())
-        }
-    }
-
-    #[test]
-    fn cache_only_pages_allow_concurrent_admission_but_active_pages_do_not() {
-        for (reclaimable, expected) in [(128, vec![2]), (0, vec![1, 1])] {
-            let (send, requests) = std::sync::mpsc::channel();
-            let mut receivers = Vec::new();
-            for _ in 0..2 {
-                let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
-                receivers.push(receiver);
-                send.send(GenRequest {
-                    prompt: vec![0; 16],
-                    max_tokens: 1,
-                    sampler: SamplingParams::default(),
-                    stop_tokens: vec![],
-                    events,
-                    mm_chunks: None,
-                    constraint: None,
-                    logprobs: None,
-                    submitted: None,
-                    canvas_read: None,
-                    user_turn: false,
-                })
-                .unwrap();
-            }
-            drop(send);
-            let mut generator = CachedPool {
-                waves: Vec::new(),
-                reclaimable,
-            };
-            run_batched(
-                &mut generator,
-                &requests,
-                2,
-                2,
-                &Arc::new(EngineMetrics::default()),
-                &ShutdownCtl::new(),
-            );
-            assert_eq!(generator.waves, expected);
-            assert_eq!(
-                generator.pool_free_blocks(),
-                Some(0),
-                "do not falsify occupancy"
-            );
-            for mut receiver in receivers {
-                let mut completed = false;
-                while let Ok(event) = receiver.try_recv() {
-                    assert!(!matches!(event, TokenEvent::Error(_)));
-                    completed |= matches!(event, TokenEvent::Done(..));
-                }
-                assert!(completed);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

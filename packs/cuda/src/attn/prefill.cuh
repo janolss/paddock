@@ -2014,6 +2014,12 @@ pd_attn_prefill_f16_v3w_kernel(
     // same mma order -> bit-identical (checksum-gated).
     // partial-S exchange panes: [HB][2][TK/8][4][32] f32, lane-owned words
     float* sh_sp = reinterpret_cast<float*>(sh_k + (size_t)TK * DPD);
+    // fp8: the NEXT tile's raw K / V bytes land here by cp.async while this
+    // tile computes (the v3c pipe); the smem->smem expand then feeds sh_k
+    constexpr bool PIPE = sizeof(KV) == 1u;
+    unsigned char* raw_k = reinterpret_cast<unsigned char*>(
+        sh_sp + (size_t)HB * 2u * (TK / 8u) * 4u * 32u);
+    unsigned char* raw_v = raw_k + (size_t)TK * D;
     __shared__ uint32_t sh_hi[NR];
     __shared__ uint32_t sh_lo[NR];     // window floors (+1), from wp
 
@@ -2095,7 +2101,48 @@ pd_attn_prefill_f16_v3w_kernel(
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
 
+    // one 16B cp.async per (key, chunk); past the walk an empty group keeps
+    // the wait accounting uniform
+    auto issue = [&](const KV* cb, unsigned char* dst, uint32_t tn) {
+        if (tn < hi) {
+            for (uint32_t u = tid; u < TK * (D / 16u); u += 256u) {
+                const uint32_t kk = u / (D / 16u), c16 = (u % (D / 16u)) * 16u;
+                const uint32_t ks = tn + kk;
+                const KV* src = (bt ? cb + ((size_t)bt[ks >> 4] * 16u + (ks & 15u)) * kv_dim
+                                    : cb + (size_t)ks * kv_dim) + c16;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                             :: "r"((uint32_t)__cvta_generic_to_shared(dst + (size_t)kk * D + c16)),
+                                "l"(src));
+            }
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+    // raw fp8 -> sh_k halves: the widened hardware pairs (e4m3 -> f16 is
+    // exact, the v3c precedent), so sh_k holds what the direct path stored
+    auto expand = [&](const unsigned char* src_raw) {
+        for (uint32_t u = tid; u < TK * (D / 8u); u += 256u) {
+            const uint32_t kk = u / (D / 8u), d8 = (u % (D / 8u)) * 8u;
+            const uint2 raw = *reinterpret_cast<const uint2*>(src_raw + (size_t)kk * D + d8);
+            const unsigned short* p16 = reinterpret_cast<const unsigned short*>(&raw);
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; ++j)
+                *reinterpret_cast<__half2*>(sh_k + (size_t)kk * DPD + d8 + 2u * j) =
+                    __half2(__nv_cvt_fp8x2_to_halfraw2(p16[j], __NV_E4M3));
+        }
+    };
+    if (PIPE && lo_t < hi) {
+        issue(kcb, raw_k, lo_t);
+        issue(vcb, raw_v, lo_t);
+        asm volatile("cp.async.wait_group 1;");   // K(lo) landed, V(lo) may pend
+        __syncthreads();
+    }
+
     for (uint32_t t0 = lo_t; t0 < hi; t0 += TK) {
+        if (PIPE) {
+            expand(raw_k);
+            __syncthreads();
+            issue(kcb, raw_k, t0 + TK);   // raw_k is free: every expand read passed
+        } else {
         // stage K [key][dim] only, all 256 threads, full D. fp8 caches
         // convert to half here (smem stays half; the mma path is unchanged).
         for (uint32_t u = tid; u < TK * (D / 8u); u += 256u) {
@@ -2118,6 +2165,7 @@ pd_attn_prefill_f16_v3w_kernel(
             }
         }
         __syncthreads();
+        }
 
         // partial S over this warp's D-half
         float s_acc[TK / 8u][4];
@@ -2125,16 +2173,23 @@ pd_attn_prefill_f16_v3w_kernel(
         for (uint32_t nt = 0; nt < TK / 8u; ++nt)
             #pragma unroll
             for (uint32_t e = 0; e < 4u; ++e) s_acc[nt][e] = 0.f;
+        // K fragments by ldmatrix.x4: matrices (keys nt*8+r, dims d0*16+0..7),
+        // (same keys, dims +8..15), then the same for nt+1 - the exact pairs
+        // the two u32 loads read, so the mma operands are bit-identical
+        const uint32_t lr = lane & 7u, lm = lane >> 3;
         #pragma unroll
         for (uint32_t d0 = 0; d0 < DH / 16u; ++d0) {
             #pragma unroll
-            for (uint32_t nt = 0; nt < TK / 8u; ++nt) {
-                uint32_t kb[2];
-                const __half* kp =
-                    sh_k + (size_t)(nt * 8u + g8) * DPD + dbase + d0 * 16u + 2u * t4;
-                kb[0] = *reinterpret_cast<const uint32_t*>(kp);
-                kb[1] = *reinterpret_cast<const uint32_t*>(kp + 8u);
-                pd_af2_mma(s_acc[nt], qa[d0], kb);
+            for (uint32_t nt = 0; nt < TK / 8u; nt += 2u) {
+                const __half* kp = sh_k + (size_t)((nt + (lm >> 1)) * 8u + lr) * DPD
+                                 + dbase + d0 * 16u + (lm & 1u) * 8u;
+                uint32_t r4[4];
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                             : "=r"(r4[0]), "=r"(r4[1]), "=r"(r4[2]), "=r"(r4[3])
+                             : "r"((uint32_t)__cvta_generic_to_shared(kp)));
+                const uint32_t kb0[2] = {r4[0], r4[1]}, kb1[2] = {r4[2], r4[3]};
+                pd_af2_mma(s_acc[nt], qa[d0], kb0);
+                pd_af2_mma(s_acc[nt + 1u], qa[d0], kb1);
             }
         }
         // exchange: both halves publish their partials to their own pane,
@@ -2149,6 +2204,8 @@ pd_attn_prefill_f16_v3w_kernel(
                 #pragma unroll
                 for (uint32_t e = 0; e < 4u; ++e)
                     mine[(nt * 4u + e) * 32u + lane] = s_acc[nt][e];
+            // V(t) landed (K(t+1) may pend): this barrier publishes it too
+            if (PIPE) asm volatile("cp.async.wait_group 1;");
             __syncthreads();
             const float* p0 = sh_sp + ((size_t)(hw * 2u + 0u) * (TK / 8u) * 4u) * 32u;
             const float* p1 = sh_sp + ((size_t)(hw * 2u + 1u) * (TK / 8u) * 4u) * 32u;
@@ -2164,6 +2221,8 @@ pd_attn_prefill_f16_v3w_kernel(
         // the old direct PV loads - masked keys' V was always read, their
         // P weights are 0. Softmax below is register-only; one barrier
         // before the PV loop publishes the staged tile.
+        if (PIPE) expand(raw_v);
+        else
         for (uint32_t u = tid; u < TK * (D / 8u); u += 256u) {
             const uint32_t kk = u / (D / 8u), d8 = (u % (D / 8u)) * 8u;
             const uint32_t ks = t0 + kk;
@@ -2233,6 +2292,7 @@ pd_attn_prefill_f16_v3w_kernel(
             o_acc[nt][3] *= corr_r[1];
         }
         __syncthreads();   // staged V visible to every warp
+        if (PIPE) issue(vcb, raw_v, t0 + TK);   // raw_v is free: expand done
         #pragma unroll
         for (uint32_t kf = 0; kf < TK / 16u; ++kf) {
             uint32_t pa[4];
@@ -2251,24 +2311,28 @@ pd_attn_prefill_f16_v3w_kernel(
             // half values the direct L2 reads produced (fp8 converted once
             // at staging), read at [key][dim] - g8 lanes span 8 consecutive
             // dims = 16B per octet, DPD padding keeps banks spread.
-            const uint32_t kl = kf * 16u + 2u * t4;
+            // V fragments by ldmatrix.x4.trans: matrices (keys kf*16+r,
+            // dims nt*8..+7), (keys +8, same dims), then dims +8 for nt+1 -
+            // the transposed load hands each lane the (key 2t4, 2t4+1) pair
+            // at dim g8 that the four scalar loads assembled
+            const uint32_t vr = lane & 7u, vm = lane >> 3;
             #pragma unroll
-            for (uint32_t nt = 0; nt < DH / 8u; ++nt) {
-                const uint32_t dd = dbase + nt * 8u + g8;
-                uint32_t vb[2];
-                const __half v0 = sh_k[(size_t)kl * DPD + dd];
-                const __half v1 = sh_k[(size_t)(kl + 1u) * DPD + dd];
-                const __half v8 = sh_k[(size_t)(kl + 8u) * DPD + dd];
-                const __half v9 = sh_k[(size_t)(kl + 9u) * DPD + dd];
-                vb[0] = ((uint32_t)__half_as_ushort(v1) << 16) |
-                        (uint32_t)__half_as_ushort(v0);
-                vb[1] = ((uint32_t)__half_as_ushort(v9) << 16) |
-                        (uint32_t)__half_as_ushort(v8);
-                pd_af2_mma(o_acc[nt], pa, vb);
+            for (uint32_t nt = 0; nt < DH / 8u; nt += 2u) {
+                const __half* vp = sh_k + (size_t)(kf * 16u + (vm & 1u) * 8u + vr) * DPD
+                                 + dbase + (nt + (vm >> 1)) * 8u;
+                uint32_t r4[4];
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                             : "=r"(r4[0]), "=r"(r4[1]), "=r"(r4[2]), "=r"(r4[3])
+                             : "r"((uint32_t)__cvta_generic_to_shared(vp)));
+                const uint32_t vb0[2] = {r4[0], r4[1]}, vb1[2] = {r4[2], r4[3]};
+                pd_af2_mma(o_acc[nt], pa, vb0);
+                pd_af2_mma(o_acc[nt + 1u], pa, vb1);
             }
         }
+        if (PIPE) asm volatile("cp.async.wait_group 1;");   // K(t+1) landed
         __syncthreads();
     }
+    if (PIPE) asm volatile("cp.async.wait_group 0;");
 
     float nrm[2];
     #pragma unroll
@@ -3050,6 +3114,8 @@ pd_attn_prefill_f16_v3c_kernel(
 #define PD_AF3W_SMEM                                                          \
     ((PD_AF3W_TK * (512u + 8u)) * 2u +                                        \
      4u * 2u * (PD_AF3W_TK / 8u) * 4u * 32u * 4u)
+// fp8 KV: + the next tile's raw K and V stages the cp.async pipe lands in
+#define PD_AF3W_SMEM_F8 (PD_AF3W_SMEM + 2u * PD_AF3W_TK * 512u)
 
 #define PD_AF3_SMEM                                                            \
     ((PD_AF3_TK * (256u + 8u) + 256u * (PD_AF3_TK + 8u)) * 2u)

@@ -1,12 +1,14 @@
 // Native affine-checkpoint BF16 operation boundaries. Activations occupy F32
 // scheduler buffers but contain BF16 values; recurrent state remains F32.
-inline float mlx_sigmoid_bf(float x) {
+template<bool Precise=false>
+inline float mlx_sigmoid_bf_impl(float x) {
     // Preserve the reference's intermediate BF16 exp/reciprocal/subtraction,
     // even when sigmoid is fused into another operation.
-    float e=mlx_bf(exp(abs(x)));
-    float tail=mlx_bf(1.0f/mlx_bf(1.0f+e));
+    float e=mlx_bf(Precise?precise::exp(abs(x)):exp(abs(x)));
+    float tail=mlx_bf(Precise?precise::divide(1.0f,mlx_bf(1.0f+e)):1.0f/mlx_bf(1.0f+e));
     return x<0 ? tail : mlx_bf(1.0f-tail);
 }
+inline float mlx_sigmoid_bf(float x) {return mlx_sigmoid_bf_impl<false>(x);}
 inline float4 mlx_sigmoid_f32(float4 x) {
     float4 tail=1.0f/(1.0f+exp(abs(x)));
     return select(1.0f-tail,tail,x<0.0f);
@@ -61,6 +63,12 @@ kernel void mlx_swiglu(device float* gate [[buffer(0)]],device const float* up [
     uint i [[thread_position_in_grid]]) {
     if(i<p[0])gate[i]=mlx_bf(mlx_bf(gate[i]*mlx_sigmoid_bf(gate[i]))*up[i]);
 }
+kernel void mlx_swiglu_precise(device float* gate [[buffer(0)]],device const float* up [[buffer(1)]],constant uint* p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
+    if(i<p[0])gate[i]=mlx_bf(mlx_bf(gate[i]*mlx_sigmoid_bf_impl<true>(gate[i]))*up[i]);
+}
+kernel void mlx_attn_gate_precise(device float* x [[buffer(0)]],device const float* qgate [[buffer(1)]],constant uint* p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
+    if(i<p[0])x[i]=mlx_bf(mlx_bf(x[i])*mlx_sigmoid_bf_impl<true>(qgate[ulong(i/256)*512+256+i%256]));
+}
 kernel void mlx_swiglu_compact(device const bfloat* gate [[buffer(0)]],device const bfloat* up [[buffer(1)]],
     device bfloat* out [[buffer(2)]],constant uint* p [[buffer(3)]],uint i [[thread_position_in_grid]]) {
     if(i<p[0]) {
@@ -88,9 +96,9 @@ kernel void splash_gateup_bf16(device bfloat* scratch [[buffer(0)]],device float
     out[ulong(p[5])*p[1]+i]=mlx_bf(mlx_bf(gate*mlx_sigmoid_bf(gate))*up);
 }
 
-kernel void mlx_dn_conv(device const float* x [[buffer(0)]],device const float* w [[buffer(1)]],device const float* history [[buffer(2)]],
-    device const uint* meta [[buffer(3)]],device const uint* bounds [[buffer(4)]],device float* out [[buffer(5)]],
-    constant uint* p [[buffer(6)]],uint i [[thread_position_in_grid]]) {
+template<bool Precise=false>
+inline void mlx_dn_conv_impl(device const float* x,device const float* w,device const float* history,
+    device const uint* meta,device const uint* bounds,device float* out,constant uint* p,uint i) {
     uint row=i/p[2],d=i%p[2];if(row>=p[3])return;
     uint first=bounds[row*2],slot=meta[row*2],pos=meta[first*2+1];float sum=0;
     for(uint j=0;j<4;++j) {
@@ -99,8 +107,13 @@ kernel void mlx_dn_conv(device const float* x [[buffer(0)]],device const float* 
             (pos>0?history[((ulong(p[5])*p[4]+slot)*3+uint(r-int(first)+3))*p[2]+d]:0.0f);
         sum+=v*w[d*4+j];
     }
-    sum=mlx_bf(sum);out[i]=mlx_bf(sum*mlx_sigmoid_bf(sum));
+    sum=mlx_bf(sum);out[i]=mlx_bf(sum*mlx_sigmoid_bf_impl<Precise>(sum));
 }
+#define MLX_CONV(NAME,PRECISE) \
+kernel void NAME(device const float* x [[buffer(0)]],device const float* w [[buffer(1)]],device const float* history [[buffer(2)]],device const uint* meta [[buffer(3)]],device const uint* bounds [[buffer(4)]],device float* out [[buffer(5)]],constant uint* p [[buffer(6)]],uint i [[thread_position_in_grid]]) {mlx_dn_conv_impl<PRECISE>(x,w,history,meta,bounds,out,p,i);}
+MLX_CONV(mlx_dn_conv,false)
+MLX_CONV(mlx_dn_conv_precise,true)
+#undef MLX_CONV
 kernel void mlx_dn_qk_norm(device float* qkv [[buffer(0)]],constant uint* p [[buffer(1)]],
     uint2 g [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {
     ulong base=ulong(g.y)*p[2]+g.x*128;float4 v=*reinterpret_cast<device float4*>(qkv+base+lane*4);
@@ -109,19 +122,24 @@ kernel void mlx_dn_qk_norm(device float* qkv [[buffer(0)]],constant uint* p [[bu
     float scale=g.x<p[0]?1.0f/128.0f:mlx_bf(0.08838834764831844f);
     *reinterpret_cast<device float4*>(qkv+base+lane*4)=mlx_bf(mlx_bf(v*inv)*scale);
 }
-kernel void mlx_dn_gates(device const float* alpha [[buffer(0)]],device const float* beta [[buffer(1)]],
-    device const float* a [[buffer(2)]],device const float* dt [[buffer(3)]],device float* gates [[buffer(4)]],
-    constant uint* p [[buffer(5)]],uint i [[thread_position_in_grid]]) {
+template<bool Precise=false>
+inline void mlx_dn_gates_impl(device const float* alpha,device const float* beta,
+    device const float* a,device const float* dt,device float* gates,constant uint* p,uint i) {
     if(i>=p[1]*p[3])return;
     float v=mlx_bf(alpha[i]+dt[i%p[1]]);
-    float e=mlx_bf(exp(-abs(v))),u=1.0f+e;
+    float e=mlx_bf(Precise?precise::exp(-abs(v)):exp(-abs(v))),u=1.0f+e;
     // Compensated log(1+x), with x in [0,1]. Preserve tiny softplus values
     // when adding one would round them away (Goldberg's log1p identity).
     float logarithm=u==1.0f ? e : e*(log(u)/(u-1.0f));
     float softplus=mlx_bf(max(v,0.0f)+mlx_bf(logarithm));
     gates[i*2]=a[i%p[1]]*softplus;
-    gates[i*2+1]=mlx_sigmoid_bf(beta[i]);
+    gates[i*2+1]=mlx_sigmoid_bf_impl<Precise>(beta[i]);
 }
+#define MLX_GATES(NAME,PRECISE) \
+kernel void NAME(device const float* alpha [[buffer(0)]],device const float* beta [[buffer(1)]],device const float* a [[buffer(2)]],device const float* dt [[buffer(3)]],device float* gates [[buffer(4)]],constant uint* p [[buffer(5)]],uint i [[thread_position_in_grid]]) {mlx_dn_gates_impl<PRECISE>(alpha,beta,a,dt,gates,p,i);}
+MLX_GATES(mlx_dn_gates,false)
+MLX_GATES(mlx_dn_gates_precise,true)
+#undef MLX_GATES
 kernel void mlx_dn_gated_norm(device float* x [[buffer(0)]],device const float* z [[buffer(1)]],device const float* w [[buffer(2)]],
     constant uint* p [[buffer(3)]],uint2 g [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {
     #pragma clang fp reassociate(off)
@@ -335,6 +353,7 @@ kernel void mlx_dn_verify_commit(device const float* updates [[buffer(0)]],devic
 // The precise frequency and explicit first-product FMA preserve the pinned
 // GPU reference's rotation at cancellation/tie boundaries. Global relaxed
 // math or the opposite contraction changes BF16 results at longer positions.
+template<bool ReciprocalPower = false>
 inline float mlx_rotary(device const float* x,device const float* w,device const uint* pos,
     ulong base,uint d,float inv,constant uint* p,uint row) {
     #pragma clang fp reassociate(off)
@@ -344,6 +363,7 @@ inline float mlx_rotary(device const float* x,device const float* w,device const
         uint j=d%(p[5]/2),other=d<p[5]/2?d+p[5]/2:d-p[5]/2;
         uint axis=j%3==1 && j<33?1:(j%3==2 && j<30?2:0);
         float frequency=precise::exp2(-float(j)/float(p[5]/2)*precise::log2(as_type<float>(p[3])));
+        if constexpr(ReciprocalPower)frequency=precise::divide(1.0f,precise::pow(as_type<float>(p[3]),float(j)/float(p[5]/2)));
         float angle=float(pos[row*4+axis])*frequency;
         float partner=mlx_bf(mlx_bf(x[base+other]*inv)*w[other]);
         float cosine=fast::cos(angle),sine=fast::sin(angle);
@@ -366,6 +386,41 @@ kernel void mlx_knorm_store(device const float* x [[buffer(0)]],device const flo
     float sum=0;for(uint d=lane;d<256;d+=32)sum+=x[src+d]*x[src+d];
     float inv=precise::rsqrt(simd_sum(sum)/256.0f+as_type<float>(p[4]));
     for(uint d=lane;d<256;d+=32){keys[dst+d]=bfloat(mlx_rotary(x,w,pos,src,d,inv,p,g.y));values[dst+d]=bfloat(v[src+d]);}
+}
+// MLX's head-256 RMS reduction assigns four consecutive values to each of
+// 64 threads, then reduces the two SIMD partials. A strided 32-thread sum
+// changes BF16 rounding even outside the rotary dimensions. Keep this
+// contract independent of prompt size, other requests and physical KV pages.
+// Algorithm reference: MLX v0.32.3 rms_norm.metal (existing MLX notice).
+inline float mlx_head256_inverse(device const float* x,ulong base,float eps,
+    uint tid,uint lane,uint sg,threadgroup float* partial) {
+    #pragma clang fp reassociate(off)
+    #pragma clang fp contract(off)
+    float sum=0;
+    for(uint j=0;j<4;++j){float v=x[base+tid*4+j];sum+=v*v;}
+    sum=simd_sum(sum);
+    if(lane==0)partial[sg]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total=simd_sum(lane<2?partial[lane]:0.0f);
+    return precise::rsqrt(total/256.0f+eps);
+}
+kernel void mlx_qnorm_rope_contiguous(device const float* x [[buffer(0)]],device const float* w [[buffer(1)]],device const uint* pos [[buffer(2)]],
+    device float* out [[buffer(3)]],constant uint* p [[buffer(4)]],uint2 g [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partial[2];
+    ulong src=(ulong(g.y)*p[0]+g.x)*512,dst=(ulong(g.y)*p[0]+g.x)*256;
+    float inv=mlx_head256_inverse(x,src,as_type<float>(p[4]),tid,lane,sg,partial);
+    for(uint j=0;j<4;++j){uint d=tid*4+j;out[dst+d]=mlx_rotary<true>(x,w,pos,src,d,inv,p,g.y);}
+}
+kernel void mlx_knorm_store_contiguous(device const float* x [[buffer(0)]],device const float* v [[buffer(1)]],device const float* w [[buffer(2)]],
+    device const uint* meta [[buffer(3)]],device const uint* pages [[buffer(4)]],device bfloat* keys [[buffer(5)]],device bfloat* values [[buffer(6)]],
+    device const uint* pos [[buffer(7)]],constant uint* p [[buffer(8)]],uint2 g [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partial[2];
+    ulong src=(ulong(g.y)*p[1]+g.x)*256;uint slot=meta[g.y*2],position=meta[g.y*2+1];
+    uint physical=pages[slot*p[2]+position/16]*16+position%16;ulong dst=(ulong(physical)*p[1]+g.x)*256;
+    float inv=mlx_head256_inverse(x,src,as_type<float>(p[4]),tid,lane,sg,partial);
+    for(uint j=0;j<4;++j){uint d=tid*4+j;keys[dst+d]=bfloat(mlx_rotary<true>(x,w,pos,src,d,inv,p,g.y));values[dst+d]=bfloat(v[src+d]);}
 }
 kernel void mlx_attn_gate(device float* x [[buffer(0)]],device const float* qgate [[buffer(1)]],constant uint* p [[buffer(2)]],
     uint i [[thread_position_in_grid]]) {

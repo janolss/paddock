@@ -4055,6 +4055,18 @@ struct KernelTableV1 {
     // 850: stop_mask_rows (logits, par, flags, rows, n, stream) - the reasoning stop mask: active
     // rows get stop pressure in flags and their stop logits set to -inf before sampling
     int (*stop_mask_rows)(void*, const void*, void*, uint32_t, uint32_t, void*);
+    // 851: kquant_gemm_w4a8_pipe4 (kquant_gemm_w4a8_pipe2's arguments) - the k-quant prefill tile
+    // with no unpacked weight tile: ldmatrix off the raw strips, nibbles and scales unpacked in
+    // registers, activations on the ring for every type; byte-identical to pipe2, which it hands
+    // the i-quant family to
+    int (*kquant_gemm_w4a8_pipe4)(const void*, const void*, const void*, const void*, void*,
+                                  uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 852: kquant_gemm_w4a8_sb (kquant_gemm_mma_ks's arguments) - the k-quant SMALL-BATCH decode
+    // GEMM (b <= 8): 16-row tiles whose 8 warps stream round-robin K slices straight into mma
+    // fragments from global, no staging; hands b > 8 and the i-quant family to mma_ks
+    int (*kquant_gemm_w4a8_sb)(const void*, const void*, const void*, const void*,
+                               const void*, void*, void*, uint32_t, uint32_t,
+                               uint32_t, uint32_t, void*);
 };
 
 } // extern "C"

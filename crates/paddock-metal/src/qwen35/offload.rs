@@ -129,11 +129,27 @@ impl Qwen35 {
         if self.stable_affine_prefill() {
             // Old admission-sized BF16 partials produce different recurrent
             // states. Never restore them under the stable cold-text contract.
-            layout.push_str(":affine-cold-text-prefill512-v1");
+            layout.push_str(if self.lighton_reference_math() {
+                ":affine-cold-text-prefill2048-v1"
+            } else {
+                ":affine-cold-text-prefill512-v1"
+            });
             // Decode may feed a later conversation prefix. States produced
             // by batch-dependent softmax reductions are not interchangeable.
             layout.push_str(":sequence-local-decode-attention-v1");
-            layout.push_str(":phase-local-affine-f32-v1");
+            layout.push_str(if self.lighton_reference_math() {
+                ":sequence-local-affine-bf16-bias-v1"
+            } else {
+                ":phase-local-affine-f32-v1"
+            });
+        }
+        if self.contiguous_head_normalization() {
+            // RMS reduction and reciprocal-power rotary frequencies affect
+            // later recurrent states even when their dimensions are unchanged.
+            layout.push_str(":head256-contiguous-rms-reciprocal-rope-v1");
+        }
+        if self.precise_recurrent_arithmetic() {
+            layout.push_str(":precise-recurrent-transcendentals-v1");
         }
         if self.register_language_attention() {
             // Attention changes every later recurrent snapshot; never restore
@@ -697,6 +713,7 @@ mod tests {
         impl Drop for Reset {
             fn drop(&mut self) {
                 attention::BASELINE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(false));
+                attention::BASELINE_HEAD_NORM_FOR_TEST.with(|v| v.set(true));
             }
         }
         let _reset = Reset;
@@ -709,14 +726,62 @@ mod tests {
         }
         assert_eq!(model.geometry, Geometry::DENSE_08B);
         let mut roots = Vec::new();
-        for baseline in [true, false, true, false] {
+        for (baseline, norm_baseline) in [
+            (true, true),
+            (false, true),
+            (false, false),
+            (false, true),
+            (true, true),
+        ] {
             attention::BASELINE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(baseline));
+            attention::BASELINE_HEAD_NORM_FOR_TEST.with(|v| v.set(norm_baseline));
             model
                 .enable_kv_offload(
                     crate::KvOffloadConfig {
                         ram_bytes: 1 << 30,
                         disk: None,
                         scope: b"lighton-arithmetic-namespace".to_vec(),
+                    },
+                    &[path],
+                )
+                .unwrap();
+            roots.push(model.cold.as_ref().unwrap().root);
+            drop(model.cold.take());
+        }
+        assert_ne!(roots[0], roots[1]);
+        assert_ne!(roots[1], roots[2]);
+        assert_ne!(roots[0], roots[2]);
+        assert_eq!(roots[1], roots[3]);
+        assert_eq!(roots[0], roots[4]);
+    }
+
+    #[test]
+    #[ignore = "requires 4B MLX vision checkpoint; complete arithmetic namespace guard"]
+    fn lighton_4b_arithmetic_has_distinct_namespace() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                forward::BASELINE_LIGHTON_FOR_TEST.set(false);
+            }
+        }
+        let _reset = Reset;
+        let path = std::env::var_os("PADDOCK_METAL_QWEN_MODEL").unwrap();
+        let path = Path::new(&path);
+        let mut model = Qwen35::load_for_offload(path, 1024, 1, None).unwrap();
+        model.attach_vision(path).unwrap();
+        assert_eq!(model.geometry, Geometry::DENSE_4B);
+        if !model.device.tensor_accelerated() {
+            return;
+        }
+        let mut roots = Vec::new();
+        for baseline in [true, false, true, false] {
+            forward::BASELINE_LIGHTON_FOR_TEST.set(baseline);
+            model
+                .enable_kv_offload(
+                    crate::KvOffloadConfig {
+                        ram_bytes: 1 << 30,
+                        disk: None,
+                        scope: b"lighton-4b-arithmetic-namespace".to_vec(),
                     },
                     &[path],
                 )

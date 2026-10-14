@@ -66,6 +66,8 @@
 #include "src/quant/kquant.cuh"     // must precede exports.cuh (which closes the table)
 #include "src/quant/kquant_w4a8.cuh"  // stage-2 W4A8 (needs kquant layouts + gemm/mmq constants)
 #include "src/quant/kquant_w4a8_ring.cuh"  // Q4_K prefill tile with its activations on the cp.async ring (slot 750; needs kquant_w4a8's pipe2 + cp.async helpers)
+#include "src/quant/kquant_w4a8_pipe4.cuh"  // k-quant prefill tile with no unpacked weight tile (slot 851; needs kquant_w4a8's pipe2 + the ldmatrix helpers)
+#include "src/quant/kquant_w4a8_sb.cuh"  // k-quant small-batch (b <= 8) decode GEMM on per-warp K slices (slot 852; needs kquant_w4a8's ks launcher + combine)
 #include "src/quant/iquant_dense.cuh" // i-quant DENSE lanes: the k-quant exports dispatch IQ types here (needs kquant_w4a8's window unpack)
 #include "src/quant/hadamard.cuh"    // blockwise Walsh-Hadamard rotation for rotated-basis checkpoints (Bonsai) + the ternary capability marker (abi.cuh helpers only)
 #include "src/quant/ternary.cuh"     // PTQ1_0 batch-1 decode lane (table-decoded, per-128 int8 activations) + its quantizer (needs iquant's loads and iquant_dense's grid)

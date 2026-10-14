@@ -5004,55 +5004,17 @@ impl GpuQwen35 {
         // the pre-split single body (the split exists so the overlap
         // scheduler can pump decode-lane ticks between the two halves).
         self.unified_launch_core(decodes, budget, plans, fin_plans)?;
-        self.dflash_flush_pending_append()?;
+        let flushed = self.dflash_flush_pending_append().map_err(Into::into);
+        self.unified_span_settle(flushed)?;
         // stage F: the decode rows' states advanced in the span
         {
             let toks: Vec<u32> = decodes.iter().map(|&(_, t, _)| t).collect();
             let pos: Vec<u32> = decodes.iter().map(|&(_, _, p)| p).collect();
             let sl: Vec<u32> = decodes.iter().map(|&(k, _, _)| k as u32).collect();
-            self.reply_after_rows(&toks, &pos, Some(&sl))?;
+            let staged = self.reply_after_rows(&toks, &pos, Some(&sl));
+            self.unified_span_settle(staged)?;
         }
         self.unified_finish_core()
-    }
-
-    /// Launch a prefill-only unified span (no decode rows) without waiting
-    /// for it: the layer walk and finisher sampling are enqueued on the main
-    /// lane and an event marks completion. Returns false (launching nothing)
-    /// when the chunk queue is empty. While the span is in flight the
-    /// overlap scheduler pumps decode-pipe ticks on the decode lane -
-    /// disjoint slots, and finishers sample in the span-side d_fin_*
-    /// buffers, so nothing touches the decode graph's rows. Admission may
-    /// APPEND to the chunk queue during the flight; `unified_span_finish`
-    /// must run before any other unified/prefill/mixed call.
-    pub fn unified_span_launch(
-        &mut self,
-        budget: usize,
-        fin_plans: &[(usize, crate::generator::RowSample)],
-    ) -> Result<bool, GpuModelError> {
-        if self.chunked.is_empty() {
-            return Ok(false);
-        }
-        self.unified_launch_core(&[], budget, &[], fin_plans)?;
-        self.dflash_flush_pending_append()?;
-        Ok(true)
-    }
-
-    /// Non-blocking: has the in-flight span's GPU work (incl. finisher
-    /// sampling) completed? True when no span is in flight.
-    pub fn unified_span_done(&self) -> bool {
-        self.unified_inflight
-            .as_ref()
-            .is_none_or(|s| self.exec.event_done(&s.ev))
-    }
-
-    /// Complete the in-flight span: drain the main lane, read finisher ids,
-    /// run the warm/prefix hooks, advance the chunk queue. Returns the
-    /// finished prompts.
-    pub fn unified_span_finish(
-        &mut self,
-    ) -> Result<Vec<(usize, crate::generator::FinishSample, usize)>, GpuModelError> {
-        let (_step, finished) = self.unified_finish_core()?;
-        Ok(finished)
     }
 
     /// Which shares are FUSED CKPT shares (their tail share of the same
@@ -5074,7 +5036,7 @@ impl GpuQwen35 {
         map
     }
 
-    fn unified_launch_core(
+    pub(super) fn unified_launch_core(
         &mut self,
         decodes: &[(usize, u32, u32)],
         budget: usize,
@@ -5107,7 +5069,7 @@ impl GpuQwen35 {
         // cap and rebuilds the misaligned 2080-row tick: measured +0.6%
         // (noise). The intrinsic pad at (prompt 2048 + riders 32) is only
         // reachable kernel-side (M-tail tile), not by budget arithmetic.
-        let base = budget.min(unified_prefill_rows()).max(1);
+        let base = mixed_prefill_cap(budget.min(unified_prefill_rows()).max(1), b);
         // f8t band clamp: with decode riders aboard AND a shallow chunk
         // queue (the steady-churn case: ~1 admission per 4 decode ticks on
         // the c32 board), cap the tick at the tc5p/tc5q 64-row band so the
@@ -8092,7 +8054,7 @@ impl GpuQwen35 {
         Ok(())
     }
 
-    fn unified_finish_core(
+    pub(super) fn unified_finish_core(
         &mut self,
     ) -> Result<
         (
@@ -9243,7 +9205,7 @@ impl GpuQwen35 {
                                 && b <= 64
                                 && exec.has_kquant_mma_ks()
                             {
-                                exec.kquant_gemm_mma_ks(
+                                exec.kquant_gemm_decode(
                                     k,
                                     &bs.d_xq,
                                     &bs.d_xs,

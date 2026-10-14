@@ -9067,6 +9067,22 @@ pub struct KernelTableV1 {
     /// temperature, at the max when greedy) and their stop logits set to
     /// -inf, in place, before the sampling kernels run.
     pub stop_mask_rows: Option<StopMaskRowsFn>,
+    /// Slot 851: `pd_kquant_gemm_w4a8_pipe4` - the k-quant prefill tile with
+    /// no unpacked weight tile: A fragments come off the raw 4-6.6 bpw strips
+    /// through ldmatrix and unpack in registers, the per-row scales expand in
+    /// registers, and the activation tile rides the cp.async ring for every
+    /// type (pipe3 could only afford that for Q4_K). Byte-identical to
+    /// `kquant_gemm_w4a8_pipe2`, which it hands the i-quant family to. Same
+    /// arguments as pipe2.
+    pub kquant_gemm_w4a8_pipe4: Option<KquantGemmW4a8Fn>,
+    /// Slot 852: `pd_kquant_gemm_w4a8_sb` - the k-quant small-batch (b <= 8)
+    /// decode GEMM: 16-row tiles whose 8 warps each stream a round-robin K
+    /// slice straight from global into mma fragments (no shared staging, no
+    /// per-step barrier), partials summed once in fixed warp order; nz > 1
+    /// writes `kquant_gemm_mma_ks`'s partial planes and reuses its combine.
+    /// Same arguments and `part` contract as `kquant_gemm_mma_ks`, which it
+    /// hands b > 8 and the i-quant family to. Reorder-equal to ks / dp4a.
+    pub kquant_gemm_w4a8_sb: Option<KquantGemmMmaKsFn>,
 }
 
 /// See [`KernelTableV1::rmsnorm_add_scale_norm`].
@@ -9090,6 +9106,23 @@ pub type Bf16QkvGemmFn = unsafe extern "C" fn(
     *const core::ffi::c_void,
     *const core::ffi::c_void,
     *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// `(data, scales, xq, xs, xsums, part, y, in_dim, out_dim, batch, dtype,
+/// stream)` - `kquant_gemm_mma_ks`'s signature, shared by slot 852.
+pub type KquantGemmMmaKsFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
     *mut core::ffi::c_void,
     *mut core::ffi::c_void,
     u32,
@@ -10992,7 +11025,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 836;
+pub const KERNEL_TABLE_SLOTS: usize = 838;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

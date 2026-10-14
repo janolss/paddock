@@ -979,3 +979,50 @@ fn embeddinggemma2_split_attention_is_bit_identical() {
         assert!(outs[0].iter().all(|x| x.is_finite()));
     }
 }
+
+/// A video frame is a picture at the checkpoint's frame budget (140 soft
+/// tokens, `video_processor.max_soft_tokens`), whatever the endpoint's
+/// picture budget: admission counts its run at that budget, the tower makes
+/// that many rows, and the frame embeds unlike the same picture at 280.
+/// (Against transformers: the video reference oracle beside the media one.)
+#[test]
+fn embeddinggemma2_video_frames_take_the_frame_budget() {
+    use paddock_engine::gpu_model::embedding_gemma2::media::{
+        BOI_TOKEN, EOI_TOKEN, IMAGE_TOKEN, VIDEO_FRAME_TOKENS, VIDEO_TOKEN, image_tokens,
+    };
+    let Some(mut m) = load_with_pictures(2048) else {
+        return;
+    };
+    let house = picture("house.jpg");
+    let MmChunk::Image { w, h, .. } = &house else {
+        unreachable!()
+    };
+    let frame = image_tokens(*w, *h, VIDEO_FRAME_TOKENS).unwrap();
+    let still = image_tokens(*w, *h, 280).unwrap();
+    assert!(frame < still, "{frame} vs {still}");
+    let block = |token: u32, n: usize| {
+        let mut s = vec![2, BOI_TOKEN];
+        s.extend(std::iter::repeat_n(token, n));
+        s.extend([EOI_TOKEN, 1]);
+        s
+    };
+    assert!(
+        m.validate_media(&[block(VIDEO_TOKEN, frame)], &[vec![house.clone()]])
+            .is_ok()
+    );
+    assert!(
+        m.validate_media(&[block(VIDEO_TOKEN, still)], &[vec![house.clone()]])
+            .is_err(),
+        "a frame run sized at the picture budget"
+    );
+    let v = m
+        .embed_media(
+            &[block(VIDEO_TOKEN, frame), block(IMAGE_TOKEN, still)],
+            &[vec![house.clone()], vec![house.clone()]],
+            None,
+        )
+        .expect("embed");
+    let cos: f32 = v[0].iter().zip(&v[1]).map(|(a, b)| a * b).sum();
+    assert!(v[0].iter().all(|x| x.is_finite()));
+    assert!(cos < 0.9999, "frame and still embed alike: {cos}");
+}

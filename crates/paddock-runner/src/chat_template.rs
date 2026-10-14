@@ -938,6 +938,56 @@ pub fn renders_tool_images(template: &str) -> bool {
     }
 }
 
+/// The template closes a prior turn's reasoning with a newline of its own and
+/// does not strip the text first - gemma4's
+/// `'<|channel>thought\n' + thinking_text + '\n<channel|>'`. The model writes
+/// that newline itself when it closes a thought, and the parser hands it back
+/// inside the reasoning (it streamed before the close marker arrived and
+/// cannot be retracted), so a turn the client echoes back re-renders one
+/// newline longer than it was generated, and the model copies the longer
+/// run: on gemma4 26B under Claude Code a tool loop's thoughts ended in 1, 2,
+/// ... 8 newlines, one more a step, and the re-rendered history left the
+/// prefix cache at every thought. Probed at load: Qwen's templates strip the
+/// reasoning themselves and Harmony closes without a newline (both false).
+pub fn reasoning_close_newline(template: &str) -> bool {
+    use serde_json::json;
+    // a tool-calling turn: gemma4's older template shows reasoning only there
+    let msgs = [
+        json!({"role": "user", "content": "probe-user"}),
+        json!({"role": "assistant", "content": "", "reasoning_content": "probe-reasoning\n",
+               "tool_calls": [{"id": "c1", "type": "function",
+                   "function": {"name": "probe", "arguments": {}}}]}),
+        json!({"role": "tool", "tool_call_id": "c1", "content": "probe-tool"}),
+    ];
+    render(template, &normalize_messages(&msgs), None, None)
+        .is_ok_and(|out| out.contains("probe-reasoning\n\n"))
+}
+
+/// Take the template's own close newline (`reasoning_close_newline`, the
+/// model's `on`) off each assistant turn's reasoning, so the turn re-renders
+/// as the text the model generated. Only ONE newline: a thought the model
+/// closed with two renders with two.
+pub fn strip_reasoning_close_newline(on: bool, messages: &mut [serde_json::Value]) {
+    if !on {
+        return;
+    }
+    for msg in messages {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        if obj.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(serde_json::Value::String(s)) = obj.get_mut(key)
+                && s.ends_with('\n')
+            {
+                s.pop();
+            }
+        }
+    }
+}
+
 /// A prior assistant turn's reasoning, under every name a template reads it by.
 ///
 /// The templates we serve disagree on the key: Qwen 3.5-3.8, Flash Next,
@@ -1251,6 +1301,42 @@ fn scan_tag_literals(template: &str, limit: usize) -> Vec<String> {
 mod tests {
     use super::{normalize_messages, parenthesize_call_ternaries, render, task_tags};
     use serde_json::json;
+
+    /// A thought the model closed with N newlines re-renders with N after the
+    /// client echoes it back - not N+1, which the model then copies a step at
+    /// a time - on every gemma4 template we serve; templates that strip the
+    /// reasoning themselves or close it without a newline are left alone.
+    #[test]
+    fn echoed_reasoning_renders_as_generated() {
+        use super::{reasoning_close_newline, strip_reasoning_close_newline};
+        let fx = |name: &str| {
+            std::fs::read_to_string(format!(
+                "{}/tests/fixtures/{name}_chat_template.jinja",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        for name in ["qwen35", "qwen36", "qwen38", "gptoss"] {
+            assert!(!reasoning_close_newline(&fx(name)), "{name}");
+        }
+        for name in ["gemma4", "gemma4_qat", "gemma4_26b_a4b"] {
+            let t = fx(name);
+            assert!(reasoning_close_newline(&t), "{name}");
+            for generated in ["Edit cedar.py next.\n", "Edit cedar.py next.\n\n"] {
+                let mut msgs = normalize_messages(&[
+                    json!({"role": "user", "content": "go"}),
+                    json!({"role": "assistant", "content": "", "reasoning_content": generated,
+                           "tool_calls": [{"id": "c1", "type": "function",
+                               "function": {"name": "edit", "arguments": {"path": "cedar.py"}}}]}),
+                    json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
+                ]);
+                strip_reasoning_close_newline(true, &mut msgs);
+                let out = render(&t, &msgs, None, None).unwrap();
+                let want = format!("<|channel>thought\n{generated}<channel|>");
+                assert!(out.contains(&want), "{name}: {generated:?} -> {out}");
+            }
+        }
+    }
 
     #[test]
     fn diffusion_default_keeps_the_published_prompt_and_explicit_controls() {

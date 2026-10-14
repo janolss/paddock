@@ -86,29 +86,23 @@ impl Qwen35 {
                     "native MLX requires the sanitized checkpoint without MTP tensors".into(),
                 ));
             }
+            let geometry = Geometry {
+                width: cfg.width,
+                ff: cfg.ff,
+                layers: cfg.layers,
+                heads: cfg.heads,
+                kv_heads: cfg.kv_heads,
+                value_heads: cfg.value_heads,
+            }
+            .validate()?;
             return Self::from_source(
-                checkpoint::Source::Mlx(source, cfg.tied),
+                checkpoint::Source::Mlx(source, cfg.tied, geometry),
                 context,
                 max_batch,
                 budget,
                 tiered,
                 source_versions,
-                (
-                    Geometry {
-                        width: cfg.width,
-                        ff: cfg.ff,
-                        layers: cfg.layers,
-                        heads: cfg.heads,
-                        kv_heads: cfg.kv_heads,
-                        value_heads: cfg.value_heads,
-                    }
-                    .validate()?,
-                    248320,
-                    64,
-                    cfg.context,
-                    cfg.eps,
-                    cfg.rope,
-                ),
+                (geometry, 248320, 64, cfg.context, cfg.eps, cfg.rope),
             );
         }
         let map = MappedGguf::open(path).map_err(|e| MetalError::Model(e.to_string()))?;
@@ -254,7 +248,7 @@ impl Qwen35 {
         }
         let mlx = matches!(
             map,
-            checkpoint::Source::Mlx(_, _)
+            checkpoint::Source::Mlx(_, _, _)
                 | checkpoint::Source::Splash(_)
                 | checkpoint::Source::Bonsai(_, _)
         );

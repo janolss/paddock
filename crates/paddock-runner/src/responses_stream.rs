@@ -153,3 +153,23 @@ impl Calls {
         }
     }
 }
+
+/// One SSE event: `event: NAME` with the JSON body.
+pub(crate) fn ev(
+    name: &str,
+    data: Value,
+) -> Result<axum::response::sse::Event, std::convert::Infallible> {
+    Ok(axum::response::sse::Event::default()
+        .event(name)
+        .data(data.to_string()))
+}
+
+/// Emit-safe prefix length: hold back a partial marker tail, on a char
+/// boundary.
+pub(crate) fn safe_len(s: &str, markers: &[&str]) -> usize {
+    let mut n = s.len() - crate::parsers::holdback(s, markers);
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    n
+}

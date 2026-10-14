@@ -47,6 +47,21 @@ pub fn park_deadline(est_us: f64) -> std::time::Duration {
     std::time::Duration::from_micros(us as u64)
 }
 
+/// The blocks round's deadline, bounded below by what abandoning would cost:
+/// a flow that is abandoned recomputes the whole restorable span, so giving
+/// up earlier than that recompute takes never saves time - it only turns a
+/// late restore into a late restore PLUS a full prefill (3 of 20 restores
+/// on a 9B, each a 26-32K prompt re-prefilled for 6-10 s, where the restore
+/// was ~0.4 s from done; the estimate is 2-4x optimistic until it has
+/// learned). Still capped, so a black-holed transport cannot hold a request
+/// for a whole long prefill.
+pub fn park_deadline_vs(est_us: f64, recompute_us: f64) -> std::time::Duration {
+    let us = (est_us * 8.0)
+        .max(recompute_us)
+        .clamp(20_000.0, 10_000_000.0);
+    std::time::Duration::from_micros(us as u64)
+}
+
 /// A zombie that never resolves (transport black-holed mid-op) is dropped
 /// after this long; an aux round's reserved checkpoint slot leaks then -
 /// bounded, logged, and strictly better than growing the zombie list.
@@ -145,13 +160,14 @@ impl RestoreFlow {
         // what the flow moves: the blob rides with the blocks
         let bytes = hit.bytes + aux.as_ref().map_or(0, |p| p.hit.bytes);
         let nvme = hit.nvme_bytes + aux.as_ref().map_or(0, |p| p.hit.nvme_bytes);
+        let recompute_us = tier.cost.recompute_us(cut as u32);
         Some(RestoreFlow {
             tokens: tokens[..cut].to_vec(),
             boundary_blocks: hit.end_block,
             aux,
             state: FlowState::Blocks {
                 ticket,
-                deadline: Instant::now() + park_deadline(est_us),
+                deadline: Instant::now() + park_deadline_vs(est_us, recompute_us),
             },
             blocks_ticket: ticket,
             started: Instant::now(),

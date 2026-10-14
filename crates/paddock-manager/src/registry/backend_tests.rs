@@ -1173,7 +1173,7 @@ fn metal_gemma_moe_uses_exact_companions() {
     assert_eq!(q8.id, "q8");
     assert!(q8.runtime.kv_cache_dtype.is_none());
     assert!(q8.runtime.qualification.is_none());
-    assert_eq!(q8.shape.as_ref().unwrap().weight_bytes, 27645605376);
+    assert_eq!(q8.shape.as_ref().unwrap().weight_bytes, 26861270528);
 }
 
 #[test]
