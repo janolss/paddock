@@ -116,17 +116,14 @@ pub fn sample() -> Option<Snapshot> {
         page as u64,
         physical,
     );
-    // Same ceiling as MetalDevice::planned_budget: Apple's working set minus
-    // 2 GiB for driver/compiler/transient work outside the buffer ledger.
-    // Do not shave another percentage of recommendedMaxWorkingSetSize; that
-    // value is already Apple's performance line. HEADROOM stays on `available`
-    // only (VM-sample uncertainty), never as a second cut of the GPU cap.
+    // The runner grants from the same ceiling (paddock_admin::metal_budget).
+    // HEADROOM stays on `available` only (VM-sample uncertainty), never as a
+    // second cut of the GPU cap.
     let recommended = device.recommendedMaxWorkingSetSize();
     Some(Snapshot {
         name: device.name().to_string(),
         physical,
-        limit: recommended
-            .saturating_sub(2 << 30)
+        limit: paddock_admin::metal_budget::gpu_ceiling(recommended)
             .min(physical.saturating_sub(HEADROOM)),
         available,
     })
@@ -396,8 +393,7 @@ mod tests {
         assert!(s.physical > 1 << 30 && s.limit <= s.physical && s.available <= s.physical);
         assert_eq!(
             s.limit,
-            recommended
-                .saturating_sub(2 << 30)
+            paddock_admin::metal_budget::gpu_ceiling(recommended)
                 .min(s.physical.saturating_sub(HEADROOM))
         );
     }

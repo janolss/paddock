@@ -16,6 +16,7 @@
 
 pub mod client;
 pub mod codec;
+pub mod metal_budget;
 pub mod residency;
 pub mod server;
 pub mod types;

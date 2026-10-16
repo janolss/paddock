@@ -10,6 +10,7 @@ publish.workspace = true
 hardened = ["paddock-models/hardened", "paddock-engine/hardened"]
 
 [dependencies]
+paddock-admin = { version = "0.1.0", path = "../paddock-admin" }
 paddock-engine = { path = "../paddock-engine", default-features = false }
 paddock-models.workspace = true
 paddock-tokenizer.workspace = true

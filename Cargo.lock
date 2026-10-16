@@ -3118,6 +3118,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "paddock-admin",
  "paddock-engine",
  "paddock-jpeg",
  "paddock-kernels",
