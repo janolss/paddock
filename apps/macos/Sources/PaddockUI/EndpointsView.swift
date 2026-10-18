@@ -147,6 +147,10 @@ struct EndpointsView: View {
             Text("·").accessibilityHidden(true)
             Text(artifact?.shortFormat ?? row.configured?.artifact ?? "Native runner")
               .lineLimit(1).truncationMode(.middle)
+            if row.runner == nil, artifact?.installed == false {
+              Text("·").accessibilityHidden(true)
+              Text("Weights not downloaded").lineLimit(1)
+            }
           }.font(.system(size: 11)).foregroundStyle(.secondary)
           Text(row.baseURL).font(.system(size: 11, design: .monospaced))
             .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)

@@ -16,6 +16,7 @@ public struct WorkspaceView: View {
   @State private var confirmNewChat = false
   @State private var startSelection: StartSelection?
   @State private var downloadSelection: StartSelection?
+  @State private var deletingDownload: ModelDeletionReview?
   private struct StartSelection: Identifiable {
     let id = UUID()
     var model: String?
@@ -170,6 +171,7 @@ public struct WorkspaceView: View {
         }
       }
     }
+    .modelDeletionConfirmation(workspace: model, review: $deletingDownload)
     .confirmationDialog(
       "Start a new chat?", isPresented: $confirmNewChat, titleVisibility: .visible
     ) {
@@ -224,10 +226,9 @@ public struct WorkspaceView: View {
         })
     case .downloads:
       DownloadsView(
-        downloads: model.downloads, canStart: model.canSubmit,
-        onStart: { modelID, artifactID in
+        workspace: model, snapshot: snapshot, onStart: { modelID, artifactID in
           configureInstance(modelID, artifactID)
-        })
+        }, deleting: $deletingDownload)
     case .runners:
       if let port = model.systemToolsPort {
         EndpointToolsView(

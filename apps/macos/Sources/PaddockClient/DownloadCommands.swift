@@ -70,6 +70,14 @@ public struct DownloadReply: Decodable, Sendable {
   public let jobs: [ModelDownload]
   public let plan: DownloadPlan?
   public let job: String?
+  public let deleted: DeletedDownload?
+  public struct DeletedDownload: Decodable, Sendable {
+    public let model: String
+    public let artifact: String
+    public let removedFiles: Int
+    public let freedBytes: UInt64
+    public let keptSharedFiles: Int
+  }
 }
 
 public enum DownloadCommand: Sendable, Encodable {
@@ -78,6 +86,7 @@ public enum DownloadCommand: Sendable, Encodable {
   case pull(DownloadPlan)
   case pause(id: String)
   case resume(id: String)
+  case delete(model: String, artifact: String)
   private enum CodingKeys: String, CodingKey { case kind, model, artifact, selection, id }
   public func encode(to encoder: any Encoder) throws {
     var values = encoder.container(keyedBy: CodingKeys.self)
@@ -98,6 +107,10 @@ public enum DownloadCommand: Sendable, Encodable {
     case .resume(let id):
       try values.encode("resume", forKey: .kind)
       try values.encode(id, forKey: .id)
+    case .delete(let model, let artifact):
+      try values.encode("delete", forKey: .kind)
+      try values.encode(model, forKey: .model)
+      try values.encode(artifact, forKey: .artifact)
     }
   }
 }

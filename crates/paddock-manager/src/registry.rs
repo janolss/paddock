@@ -1020,6 +1020,17 @@ async fn download_stream(
 
 // ─── pull manager (stateful, on AppState) ───────────────────────────────────
 
+/// Files removed by a native catalog delete. Counts cover only destinations
+/// that existed on disk; shared companions kept for other installs are separate.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteSelection {
+    pub model: String,
+    pub artifact: String,
+    pub removed_files: usize,
+    pub freed_bytes: u64,
+    pub kept_shared_files: usize,
+}
+
 /// Status of a pull job, JSON-tagged for the Studio to poll.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
@@ -1551,6 +1562,165 @@ impl Registry {
     pub fn is_installed(&self, m: &CatalogModel) -> bool {
         m.weights()
             .any(|a| a.runtime.supports_backend(&self.backend) && self.is_artifact_installed(a))
+    }
+
+    /// Delete downloaded files for a catalog selection. Paths come only from
+    /// catalog destinations — never from the caller. Companions still required
+    /// by another installed weights option on this backend are kept.
+    pub fn delete_selection(
+        &self,
+        model_id: &str,
+        artifact_ids: &[String],
+    ) -> Result<DeleteSelection, String> {
+        if artifact_ids.is_empty() {
+            return Err("Select weights to delete from the library".into());
+        }
+        let model = self
+            .catalog_of(model_id)
+            .ok_or("Select a model from the library")?;
+        let mut selected = Vec::with_capacity(artifact_ids.len());
+        for id in artifact_ids {
+            let artifact = model
+                .artifact(id)
+                .ok_or_else(|| format!("Select a weights option from the library ({id})"))?;
+            selected.push(artifact);
+        }
+        if self.selection_pull_active(model_id, artifact_ids) {
+            return Err("Pause or finish the active download before deleting these files.".into());
+        }
+        let protected = self.protected_destinations(model, artifact_ids);
+        let mut removed_files = 0_usize;
+        let mut freed_bytes = 0_u64;
+        let mut kept_shared_files = 0_usize;
+        let mut seen = std::collections::HashSet::new();
+        for artifact in selected {
+            for file in &artifact.files {
+                if !seen.insert(file.dest.as_str()) {
+                    continue;
+                }
+                if protected.contains(file.dest.as_str()) {
+                    kept_shared_files += 1;
+                    continue;
+                }
+                let path = self.models_dir.join(&file.dest);
+                match std::fs::metadata(&path) {
+                    Ok(metadata) => {
+                        let bytes = metadata.len();
+                        if metadata.is_dir() {
+                            std::fs::remove_dir_all(&path)
+                                .map_err(|e| format!("Could not delete {}: {e}", path.display()))?;
+                        } else {
+                            std::fs::remove_file(&path)
+                                .map_err(|e| format!("Could not delete {}: {e}", path.display()))?;
+                        }
+                        freed_bytes = freed_bytes.saturating_add(bytes);
+                        removed_files += 1;
+                        Self::prune_empty_ancestors(&self.models_dir, &path);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("Could not inspect {}: {error}", path.display()));
+                    }
+                }
+            }
+        }
+        if removed_files == 0 && kept_shared_files == 0 {
+            return Err("These weights are not downloaded.".into());
+        }
+        Ok(DeleteSelection {
+            model: model_id.into(),
+            artifact: artifact_ids[0].clone(),
+            removed_files,
+            freed_bytes,
+            kept_shared_files,
+        })
+    }
+
+    fn selection_pull_active(&self, model_id: &str, artifact_ids: &[String]) -> bool {
+        self.jobs().iter().any(|job| {
+            let running = matches!(
+                &*job
+                    .status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                PullStatus::Running
+            );
+            if !running || job.model_id != model_id {
+                return false;
+            }
+            match &job.artifacts {
+                None => true,
+                Some(ids) => {
+                    ids.iter().any(|id| artifact_ids.contains(id))
+                        || artifact_ids.iter().any(|id| ids.contains(id))
+                }
+            }
+        })
+    }
+
+    /// Destinations that must survive deleting `artifact_ids`:
+    /// - other installed Metal weights not in the delete set
+    /// - companions those retained weights still allow (even if listed to delete)
+    /// - any other installed non-weights artifact outside the delete set
+    fn protected_destinations<'a>(
+        &self,
+        model: &'a CatalogModel,
+        deleting: &[String],
+    ) -> std::collections::HashSet<&'a str> {
+        let mut protected = std::collections::HashSet::new();
+        let retained_weights: Vec<_> = model
+            .weights()
+            .filter(|weights| {
+                !deleting.contains(&weights.id)
+                    && weights.runtime.supports_backend(&self.backend)
+                    && self.is_artifact_installed(weights)
+            })
+            .collect();
+        for weights in &retained_weights {
+            for file in &weights.files {
+                protected.insert(file.dest.as_str());
+            }
+            for companion in &model.artifacts {
+                if companion.kind == ArtifactKind::Weights
+                    || !weights.runtime.allows_companion(&companion.id)
+                    || !companion.runtime.supports_backend(&self.backend)
+                    || !self.is_artifact_installed(companion)
+                {
+                    continue;
+                }
+                for file in &companion.files {
+                    protected.insert(file.dest.as_str());
+                }
+            }
+        }
+        for artifact in &model.artifacts {
+            if deleting.contains(&artifact.id)
+                || artifact.kind == ArtifactKind::Weights
+                || !self.is_artifact_installed(artifact)
+                || retained_weights
+                    .iter()
+                    .any(|weights| weights.runtime.allows_companion(&artifact.id))
+            {
+                continue;
+            }
+            for file in &artifact.files {
+                protected.insert(file.dest.as_str());
+            }
+        }
+        protected
+    }
+
+    fn prune_empty_ancestors(models_dir: &Path, removed_file: &Path) {
+        let mut current = removed_file.parent().map(Path::to_path_buf);
+        while let Some(dir) = current {
+            if dir == models_dir || !dir.starts_with(models_dir) {
+                break;
+            }
+            match std::fs::remove_dir(&dir) {
+                Ok(()) => current = dir.parent().map(Path::to_path_buf),
+                Err(_) => break,
+            }
+        }
     }
 
     /// Reverse resolution: which catalog `(model id, weights-artifact id)`
