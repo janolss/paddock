@@ -232,6 +232,8 @@ public final class WorkspaceModel {
 
   /// App-owned polling outlives windows. Slow loading stays in Rust; idle
   /// polling is modest, active operations get a one-second completion update.
+  /// Skip while a refresh is already in flight — silent polls no longer flip
+  /// `state` to `.loading`, so `pending` is the reentrancy guard.
   public func beginMonitoring() {
     guard monitor == nil, state != .stopped else { return }
     monitor = Task { [weak self] in
@@ -239,7 +241,7 @@ public final class WorkspaceModel {
         let active = self?.operationInProgress == true || self?.showsGPUMetrics == true
         do { try await Task.sleep(for: .seconds(active ? 1 : 5)) } catch { return }
         guard let self, self.state != .stopped else { return }
-        if self.state != .loading && !self.quitting { await self.refresh() }
+        if self.pending == nil && !self.quitting { await self.refresh() }
       }
     }
   }
@@ -273,12 +275,15 @@ public final class WorkspaceModel {
 
   /// Latest refresh wins even when an older request ignores cancellation.
   /// Errors retain the previous snapshot with its original timestamp.
+  /// Background polls keep the prior ready/failed state so `canSubmit` and
+  /// button opacity do not flicker; only a cold load (no snapshot yet) shows
+  /// `.loading`, matching the Studio shell's silent reconcile path.
   public func refresh() async {
     guard state != .stopped else { return }
     generation &+= 1
     let attempt = generation
     pending?.cancel()
-    state = .loading
+    if snapshot == nil { state = .loading }
     let client = self.client
     let task = Task { try await client.snapshot() }
     pending = task

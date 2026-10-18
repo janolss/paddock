@@ -23,6 +23,10 @@ pub(crate) enum Command {
     Resume {
         id: String,
     },
+    Delete {
+        model: String,
+        artifact: String,
+    },
 }
 
 fn selection(registry: &Registry, model: &str, artifact: &str) -> Result<Vec<String>, String> {
@@ -128,6 +132,19 @@ pub(crate) fn execute(registry: &Registry, command: Command) -> Result<String, S
         Command::Resume { id } => {
             validate_job(registry, &id)?;
             result["job"] = registry.resume_pull(&id).map_err(|e| e.to_string())?.into();
+        }
+        Command::Delete { model, artifact } => {
+            let ids = selection(registry, &model, &artifact)?;
+            let deleted = registry
+                .delete_selection(&model, &ids)
+                .map_err(|e| e.to_string())?;
+            result["deleted"] = json!({
+                "model": deleted.model,
+                "artifact": deleted.artifact,
+                "removed_files": deleted.removed_files,
+                "freed_bytes": deleted.freed_bytes,
+                "kept_shared_files": deleted.kept_shared_files,
+            });
         }
     }
     result["jobs"] = Value::Array(
@@ -329,8 +346,113 @@ mod tests {
             r#"{"kind":"pull","model":"x","artifact":"y","selection":[],"url":"https://example.com"}"#,
             r#"{"kind":"list","key":"secret"}"#,
             r#"{"kind":"delete","id":"x"}"#,
+            r#"{"kind":"delete","model":"x","artifact":"y","path":"/tmp"}"#,
         ] {
             assert!(serde_json::from_str::<Command>(invalid).is_err());
         }
+        assert!(
+            serde_json::from_str::<Command>(
+                r#"{"kind":"delete","model":"qwen3.8-27b","artifact":"mlx-4bit"}"#
+            )
+            .is_ok()
+        );
+    }
+
+    fn tiny_delete_registry(dir: &std::path::Path) -> Registry {
+        let mut model = Registry::new(dir.into())
+            .with_backend("metal")
+            .catalog_of("embeddinggemma-2")
+            .unwrap()
+            .clone();
+        model.id = "fixture".into();
+        let mut weights = model.artifact("q8").unwrap().clone();
+        weights.id = "q8".into();
+        weights.files = vec![paddock_manager::registry::CatalogFile {
+            dest: "fixture/q8.gguf".into(),
+            url: "https://example.invalid/q8.gguf".into(),
+            size: 4,
+            sha256: "1".repeat(64),
+        }];
+        let mut alt = weights.clone();
+        alt.id = "q8-alt".into();
+        alt.default = false;
+        alt.files = vec![paddock_manager::registry::CatalogFile {
+            dest: "fixture/q8-alt.gguf".into(),
+            url: "https://example.invalid/q8-alt.gguf".into(),
+            size: 4,
+            sha256: "2".repeat(64),
+        }];
+        let mut vision = model.artifact("vision").unwrap().clone();
+        vision.files = vec![paddock_manager::registry::CatalogFile {
+            dest: "fixture/vision.gguf".into(),
+            url: "https://example.invalid/vision.gguf".into(),
+            size: 4,
+            sha256: "3".repeat(64),
+        }];
+        model.artifacts = vec![weights, alt, vision];
+        Registry::from_catalog(
+            paddock_manager::registry::Catalog {
+                schema: 3,
+                models: vec![model],
+            },
+            dir.into(),
+        )
+        .with_backend("metal")
+    }
+
+    fn install(registry: &Registry, ids: &[&str]) {
+        let model = registry.catalog_of("fixture").unwrap();
+        for id in ids {
+            for file in &model.artifact(id).unwrap().files {
+                let path = registry.models_dir().join(&file.dest);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, vec![7u8; file.size as usize]).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn native_delete_removes_weights_and_unshared_companions() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = tiny_delete_registry(dir.path());
+        install(&registry, &["q8", "vision"]);
+        let reply: Value = serde_json::from_str(
+            &execute(
+                &registry,
+                Command::Delete {
+                    model: "fixture".into(),
+                    artifact: "q8".into(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["deleted"]["model"], "fixture");
+        assert_eq!(reply["deleted"]["artifact"], "q8");
+        assert_eq!(reply["deleted"]["removed_files"], 2);
+        assert_eq!(reply["deleted"]["kept_shared_files"], 0);
+        let model = registry.catalog_of("fixture").unwrap();
+        assert!(!registry.is_artifact_installed(model.artifact("q8").unwrap()));
+        assert!(!registry.is_artifact_installed(model.artifact("vision").unwrap()));
+        assert!(!dir.path().join("fixture").exists());
+    }
+
+    #[test]
+    fn native_delete_keeps_companion_needed_by_another_installed_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = tiny_delete_registry(dir.path());
+        install(&registry, &["q8", "q8-alt", "vision"]);
+        execute(
+            &registry,
+            Command::Delete {
+                model: "fixture".into(),
+                artifact: "q8".into(),
+            },
+        )
+        .unwrap();
+        let model = registry.catalog_of("fixture").unwrap();
+        assert!(!registry.is_artifact_installed(model.artifact("q8").unwrap()));
+        assert!(registry.is_artifact_installed(model.artifact("q8-alt").unwrap()));
+        assert!(registry.is_artifact_installed(model.artifact("vision").unwrap()));
     }
 }

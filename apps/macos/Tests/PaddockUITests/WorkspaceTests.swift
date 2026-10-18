@@ -77,6 +77,28 @@ struct WorkspaceTests {
     #expect(model.state == .failed("Test failure"))
   }
 
+  @Test func backgroundRefreshStaysSilentWhileSnapshotIsKept() async throws {
+    let loader = ControlledLoader()
+    let model = WorkspaceModel(client: loader)
+    let initial = Task { await model.start() }
+    await loader.waitForCall(1)
+    await loader.resolve(1, with: .success(try fixture()))
+    await initial.value
+    #expect(model.state == .ready)
+    #expect(model.canSubmit)
+    let refresh = Task { await model.refresh() }
+    await loader.waitForCall(2)
+    // In-flight reconcile must not flip to .loading — that briefly disables
+    // canSubmit and flashes FlatButtonStyle opacity on every poll.
+    #expect(model.state == .ready)
+    #expect(model.canSubmit)
+    #expect(model.snapshot != nil)
+    await loader.resolve(2, with: .success(try fixture(version: "next")))
+    await refresh.value
+    #expect(model.state == .ready)
+    #expect(model.snapshot?.identity.version == "next")
+  }
+
   @Test func cancellationDoesNotPublishLateResults() async throws {
     let loader = ControlledLoader()
     let model = WorkspaceModel(client: loader)

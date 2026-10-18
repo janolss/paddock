@@ -19,6 +19,12 @@ struct DownloadCommandTests {
     #expect(Set(encoded.keys) == ["kind", "model", "artifact", "selection"])
     #expect(encoded["selection"] as? [String] == ["mlx", "vision"])
     #expect(plan.fits)
+    let delete = try #require(
+      JSONSerialization.jsonObject(
+        with: JSONEncoder().encode(DownloadCommand.delete(model: "qwen", artifact: "mlx")))
+        as? [String: Any])
+    #expect(Set(delete.keys) == ["kind", "model", "artifact"])
+    #expect(delete["kind"] as? String == "delete")
     let noSpace = try ManagerWire.decode(
       DownloadPlan.self,
       from: Data(

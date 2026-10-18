@@ -97,13 +97,16 @@ struct DownloadsTests {
   @Test func listFitsLightAndDarkAtNarrowWindowWidth() async throws {
     _ = NSApplication.shared
     let fixture = DownloadFixture(reply: try Self.reply(state: "cancelled"))
-    let model = DownloadsModel(client: fixture)
-    await model.refresh()
+    let workspace = WorkspaceModel(client: fixture)
+    await workspace.start()
+    defer { Task { await workspace.shutdown() } }
+    await workspace.downloads.refresh()
+    let snapshot = try #require(workspace.snapshot)
     for dark in [false, true] {
       let host = NSHostingController(
         rootView: DownloadsView(
-          downloads: model, canStart: true,
-          onStart: { _, _ in }
+          workspace: workspace, snapshot: snapshot, onStart: { _, _ in },
+          deleting: .constant(nil)
         ).environment(\.colorScheme, dark ? .dark : .light))
       let size = host.sizeThatFits(in: CGSize(width: 640, height: 650))
       #expect(size.width <= 640)
@@ -113,7 +116,6 @@ struct DownloadsTests {
       // whether this flexible page accepts the proposed narrow viewport.
       #expect(host.sizeThatFits(in: CGSize(width: 640, height: 650)).width <= 640)
     }
-    model.stop()
   }
 
   @Test func emptyAndUnavailableStatesFillTheRemainingViewport() {
@@ -137,14 +139,17 @@ struct DownloadsTests {
 
   @Test func visibleEmptyGroupIsCenteredOnTheWholePageNotBelowItsHeader() async throws {
     let reply = try ManagerWire.decode(DownloadReply.self, from: Data(#"{"jobs":[]}"#.utf8))
-    let model = DownloadsModel(client: DownloadFixture(reply: reply))
-    await model.refresh()
-    defer { model.stop() }
+    let fixture = DownloadFixture(reply: reply, emptyCatalog: true)
+    let workspace = WorkspaceModel(client: fixture)
+    await workspace.start()
+    defer { Task { await workspace.shutdown() } }
+    await workspace.downloads.refresh()
+    let snapshot = try #require(workspace.snapshot)
     for size in [CGSize(width: 640, height: 650), CGSize(width: 1100, height: 800)] {
       let renderer = ImageRenderer(
         content: DownloadsView(
-          downloads: model, canStart: true,
-          onStart: { _, _ in }
+          workspace: workspace, snapshot: snapshot, onStart: { _, _ in },
+          deleting: .constant(nil)
         ).frame(width: size.width, height: size.height)
           .environment(\.colorScheme, .dark))
       renderer.scale = 1
@@ -179,14 +184,23 @@ struct DownloadsTests {
 private actor DownloadFixture: ManagerLoading {
   var reply: DownloadReply
   var fails = false
-  init(reply: DownloadReply) { self.reply = reply }
+  let emptyCatalog: Bool
+  init(reply: DownloadReply, emptyCatalog: Bool = false) {
+    self.reply = reply
+    self.emptyCatalog = emptyCatalog
+  }
   func set(_ reply: DownloadReply) {
     self.reply = reply
     fails = false
   }
   func fail() { fails = true }
   func snapshot() async throws -> ManagerSnapshot {
-    throw ManagerError.core("Not used by this fixture")
+    let base = try endpointFixture()
+    if !emptyCatalog { return base }
+    return try ManagerSnapshot(
+      identity: base.identity, readiness: base.readiness,
+      catalog: ManagerWire.decode(ModelCatalog.self, from: Data(#"{"schema":3,"models":[]}"#.utf8)),
+      runners: [], servers: [])
   }
   func downloads(_ command: DownloadCommand) async throws -> DownloadReply {
     if fails { throw ManagerError.core("Synthetic connection failure") }

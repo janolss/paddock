@@ -2,9 +2,36 @@ import PaddockClient
 import SwiftUI
 
 struct DownloadsView: View {
-  @Bindable var downloads: DownloadsModel
-  let canStart: Bool
+  @Bindable var workspace: WorkspaceModel
+  let snapshot: ManagerSnapshot
   let onStart: (String, String) -> Void
+  @Binding var deleting: ModelDeletionReview?
+
+  private var downloads: DownloadsModel { workspace.downloads }
+  private var transfers: [ModelDownload] {
+    downloads.visible.filter { !$0.complete }
+  }
+  private var installed: [InstalledDownload] {
+    let backend = snapshot.readiness.backend
+    let transferring = Set(
+      transfers.compactMap { job -> String? in
+        guard let weights = job.weights else { return nil }
+        return job.model + ":" + weights
+      })
+    return snapshot.catalog.models.flatMap { model in
+      model.artifacts.compactMap { artifact -> InstalledDownload? in
+        guard artifact.kind == "weights", artifact.installed, artifact.supports(backend: backend)
+        else { return nil }
+        guard !transferring.contains(model.id + ":" + artifact.id) else { return nil }
+        return InstalledDownload(model: model, artifact: artifact)
+      }
+    }.sorted {
+      let names = $0.model.display.localizedStandardCompare($1.model.display)
+      if names != .orderedSame { return names == .orderedAscending }
+      return $0.artifact.id < $1.artifact.id
+    }
+  }
+  private var isEmpty: Bool { transfers.isEmpty && installed.isEmpty }
 
   var body: some View {
     VStack(spacing: 0) {
@@ -19,13 +46,17 @@ struct DownloadsView: View {
           }.font(.system(size: 12)).foregroundStyle(PaddockStyle.caution)
         }
       }.padding(32)
-      if downloads.visible.isEmpty {
+      if isEmpty {
         Spacer(minLength: 0)
       } else {
         PaddockScrollView {
           LazyVStack(spacing: 0) {
-            ForEach(downloads.visible) { job in
-              row(job)
+            ForEach(transfers) { job in
+              transferRow(job)
+              WorkspaceRule()
+            }
+            ForEach(installed) { row in
+              installedRow(row)
               WorkspaceRule()
             }
           }.padding(.horizontal, 32).padding(.bottom, 32)
@@ -34,7 +65,7 @@ struct DownloadsView: View {
       }
     }.frame(maxWidth: .infinity, maxHeight: .infinity)
       .overlay {
-        if downloads.visible.isEmpty {
+        if isEmpty {
           if !downloads.loaded && downloads.error == nil {
             ProgressView("Loading downloads…")
               .frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
@@ -48,7 +79,7 @@ struct DownloadsView: View {
       .accessibilityIdentifier("downloads-list")
   }
 
-  private func row(_ job: ModelDownload) -> some View {
+  private func transferRow(_ job: ModelDownload) -> some View {
     VStack(alignment: .leading, spacing: 12) {
       HStack(alignment: .top, spacing: 16) {
         VStack(alignment: .leading, spacing: 6) {
@@ -67,21 +98,15 @@ struct DownloadsView: View {
             Task { await downloads.perform(.resume(id: job.id)) }
           }.buttonStyle(FlatButtonStyle()).disabled(downloads.busy)
             .accessibilityIdentifier("download-resume-\(job.id)")
-        } else if job.complete, let artifact = job.weights {
-          Button("Configure instance", systemImage: "plus") { onStart(job.model, artifact) }
-            .buttonStyle(FlatButtonStyle(primary: true)).disabled(!canStart)
-            .accessibilityIdentifier("download-start-\(job.id)")
         }
       }
-      if !job.complete {
-        ProgressView(value: job.progress).tint(PaddockStyle.accent)
-          .accessibilityLabel("\(job.display) download progress")
-        HStack {
-          Text("\(DisplayFormat.bytes(job.downloaded)) of \(DisplayFormat.bytes(job.total))")
-          Spacer()
-          Text(job.progress, format: .percent.precision(.fractionLength(0)))
-        }.font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
-      }
+      ProgressView(value: job.progress).tint(PaddockStyle.accent)
+        .accessibilityLabel("\(job.display) download progress")
+      HStack {
+        Text("\(DisplayFormat.bytes(job.downloaded)) of \(DisplayFormat.bytes(job.total))")
+        Spacer()
+        Text(job.progress, format: .percent.precision(.fractionLength(0)))
+      }.font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
       if let message = job.status.message {
         Text(verbatim: message).font(.system(size: 12)).foregroundStyle(PaddockStyle.caution)
           .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
@@ -95,6 +120,44 @@ struct DownloadsView: View {
       }
     }.padding(.vertical, 20).accessibilityElement(children: .contain)
   }
+
+  private func installedRow(_ row: InstalledDownload) -> some View {
+    let review = ModelDeletionReview(
+      model: row.model, artifact: row.artifact, backend: snapshot.readiness.backend,
+      snapshot: snapshot, latestJob: workspace.latestJob)
+    return HStack(alignment: .top, spacing: 16) {
+      VStack(alignment: .leading, spacing: 6) {
+        Text(verbatim: row.model.display).font(.system(size: 14, weight: .medium))
+        Text(
+          "\(row.artifact.displayLabel) · \(DisplayFormat.bytes(row.artifact.totalSize)) · Ready to start"
+        )
+        .font(.system(size: 12)).foregroundStyle(.secondary)
+      }
+      Spacer(minLength: 8)
+      if let review {
+        Button("Delete downloads…", systemImage: "trash", role: .destructive) {
+          deleting = review
+        }
+        .labelStyle(.iconOnly).buttonStyle(QuietButtonStyle())
+        .frame(width: 32, height: 32)
+        .disabled(!workspace.canDeleteDownloaded(review))
+        .accessibilityLabel("Delete downloaded weights for \(row.model.display)")
+        .accessibilityIdentifier("download-delete-\(row.model.id)-\(row.artifact.id)")
+        .help("Delete downloaded model files")
+      }
+      Button("Configure instance", systemImage: "plus") {
+        onStart(row.model.id, row.artifact.id)
+      }
+      .buttonStyle(FlatButtonStyle(primary: true)).disabled(!workspace.canSubmit)
+      .accessibilityIdentifier("download-start-\(row.model.id)-\(row.artifact.id)")
+    }.padding(.vertical, 20).accessibilityElement(children: .contain)
+  }
+}
+
+private struct InstalledDownload: Identifiable {
+  let model: CatalogModel
+  let artifact: CatalogArtifact
+  var id: String { model.id + ":" + artifact.id }
 }
 
 /// Center the visible icon/text group as a single unit. ContentUnavailableView
