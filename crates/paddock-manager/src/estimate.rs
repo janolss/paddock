@@ -466,6 +466,11 @@ pub(crate) fn metal_cache_shape(
         };
         shape.kv_reserve_sequences = retained * env.concurrency;
     }
+    // The native Granite loader sizes its paged KV for `max_batch + 1`
+    // sequences: one extra for shared-prefix retention.
+    if model.family.as_deref() == Some("granite") {
+        shape.kv_reserve_sequences = shape.kv_reserve_sequences.max(1);
+    }
 }
 
 /// Metal uses fixed context reservations, not CUDA's dynamically sized pool
@@ -481,6 +486,11 @@ pub(crate) fn backend_estimate(
     if backend != "metal" || shape.kind != ModelKind::Generative {
         return result;
     }
+    // Shared fixed overhead is the CUDA context plus its captured decode graph.
+    // Metal has neither, so leaving it in resident refuses models that fit.
+    let cuda_graph = result.overhead_parts.fixed;
+    result.resident = result.resident.saturating_sub(cuda_graph);
+    result.overhead_parts.fixed = 0;
     let sequences = env
         .concurrency
         .max(1)
@@ -502,11 +512,25 @@ pub(crate) fn backend_estimate(
         result.resident += extra;
     }
     result.overhead_parts.prefix_pool_extra = 0;
+    // Native Gemma 4 graphs have an exact loader formula; price KV and the
+    // context-independent scratch with it instead of the generic estimate.
+    let gemma = crate::gemma_metal::Gemma4Metal::detect(shape);
+    if let Some(g) = &gemma {
+        let scratch = g.scratch_bytes(env.concurrency.max(1));
+        let extra = scratch.saturating_sub(shape.workspace_bytes);
+        result.resident = result.resident.saturating_add(extra);
+    }
     let headroom = device.free_bytes.saturating_sub(result.resident);
-    let cost = |ctx: u64| {
-        shape
+    let cost = |ctx: u64| match &gemma {
+        Some(g) => {
+            let batch = env.concurrency.max(1);
+            g.kv_bytes(ctx, batch).saturating_add(
+                crate::gemma_metal::Gemma4Metal::page_table_bytes(ctx, batch),
+            )
+        }
+        None => shape
             .kv_per_sequence(ctx.div_ceil(32) * 32, env.kv_dtype)
-            .saturating_mul(sequences)
+            .saturating_mul(sequences),
     };
     let (mut low, mut high) = (0, shape.max_ctx);
     while low < high {
@@ -1132,6 +1156,71 @@ mod tests {
             };
             assert!(super::backend_estimate("metal", &shape, &env, &short).max_ctx < 4096);
         }
+    }
+
+    #[test]
+    fn metal_gemma_26b_uses_loader_formulas_not_the_cuda_workspace() {
+        use paddock_estimator::{Device, Envelope, KvDtype};
+        let reg = Registry::new(std::env::temp_dir()).with_backend("metal");
+        let model = reg.catalog_of("gemma-4-26b-a4b").unwrap();
+        let artifact = model.artifact("q8").unwrap();
+        let mem = artifact
+            .runtime
+            .memory
+            .as_ref()
+            .expect("metal memory block");
+        assert_eq!((mem.max_ctx, mem.max_batch), (32768, 64));
+        let mut shape = artifact.shape.clone().unwrap().into_model_shape(0, 0);
+        mem.apply(&mut shape);
+        assert_eq!(shape.workspace_bytes, 0);
+        assert!(crate::gemma_metal::Gemma4Metal::detect(&shape).is_some());
+        let env = Envelope {
+            concurrency: 1,
+            kv_dtype: KvDtype::F16,
+            spec: None,
+            offload: None,
+        };
+        let device = |free| Device {
+            free_bytes: free,
+            total_bytes: 64 << 30,
+        };
+        let roomy = super::backend_estimate("metal", &shape, &env, &device(60 << 30));
+        assert_eq!(roomy.max_ctx, 32768);
+        assert_eq!(roomy.kv_pool, 2_642_411_520 + 8192);
+        // The 6 GB CUDA staging workspace must not be charged on Metal.
+        assert!(roomy.resident < shape.weight_bytes + (3 << 30));
+        // Exactly the 8K KV (+ page table) fits above resident, not one page more.
+        let tight = super::backend_estimate(
+            "metal",
+            &shape,
+            &env,
+            &device(roomy.resident + 1_132_462_080 + 2048),
+        );
+        assert_eq!(tight.max_ctx, 8192);
+    }
+
+    #[test]
+    fn metal_granite_reserves_the_runner_prefix_sequence() {
+        use paddock_estimator::{Envelope, KvDtype};
+        let reg = Registry::new(std::env::temp_dir()).with_backend("metal");
+        let model = reg.catalog_of("granite-4.2-8b").unwrap();
+        let mut shape = model
+            .artifact("q8")
+            .unwrap()
+            .shape
+            .clone()
+            .unwrap()
+            .into_model_shape(0, 0);
+        let env = Envelope {
+            concurrency: 1,
+            kv_dtype: KvDtype::F16,
+            spec: None,
+            offload: None,
+        };
+        // Granite path ignores artifact; None keeps the call aligned with main's signature.
+        super::metal_cache_shape(&mut shape, model, None, &env);
+        // Runner allocates (max_batch + 1) sequences: 2 x 1.34 GB at 8K.
+        assert_eq!(shape.kv_reserve_sequences, 1);
     }
 
     #[test]

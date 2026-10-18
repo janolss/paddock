@@ -324,18 +324,16 @@ impl MetalDevice {
     }
 
     /// Fixed-resident models can use an exact audited reservation instead of
-    /// the generic 90% estimate. This never raises an explicit user grant or
-    /// an OS limit, and leaves 2 GiB below Apple's recommendation for driver,
-    /// compiler and transient allocations outside the native buffer ledger.
+    /// the generic estimate. This never raises an explicit user grant or an OS
+    /// limit, and leaves the shared driver reserve below Apple's recommendation
+    /// for driver, compiler and transient allocations outside the buffer ledger.
     pub(crate) fn new_planned(budget: Option<u64>, required: u64) -> Result<Self> {
         objc2::rc::autoreleasepool(|_| Self::new_inner(budget, Some(required)))
     }
 
     fn planned_budget(recommended: u64, budget: Option<u64>, required: u64) -> Result<u64> {
-        let ceiling = recommended.saturating_sub(2 << 30);
-        let grant = budget
-            .unwrap_or_else(|| (recommended * 9 / 10).max(required))
-            .min(ceiling);
+        let ceiling = paddock_admin::metal_budget::gpu_ceiling(recommended);
+        let grant = budget.unwrap_or(ceiling).min(ceiling);
         if required == 0 || required > grant {
             return Err(MetalError::Memory(format!(
                 "fixed-resident plan needs {required} bytes; grant {grant}, Apple recommendation {recommended}, 2 GiB driver/transient reserve; no memory-limit override or offload fallback"
@@ -370,7 +368,8 @@ impl MetalDevice {
         let budget = if let Some(required) = required {
             Self::planned_budget(recommended, budget, required)?
         } else {
-            budget.unwrap_or(recommended * 9 / 10).min(recommended)
+            let ceiling = paddock_admin::metal_budget::gpu_ceiling(recommended);
+            budget.unwrap_or(ceiling).min(ceiling)
         };
         if budget == 0 {
             return Err(MetalError::Memory("zero budget".into()));
@@ -2624,7 +2623,7 @@ mod tests {
         let required = 112_000_000_000;
         assert_eq!(
             MetalDevice::planned_budget(recommended, None, required).unwrap(),
-            required
+            recommended - (2 << 30)
         );
         assert!(MetalDevice::planned_budget(recommended, Some(100_000_000_000), required).is_err());
         assert!(MetalDevice::planned_budget(recommended, None, recommended - (1 << 30)).is_err());

@@ -70,14 +70,14 @@ impl Gemma4 {
 }
 
 /// Unified RAM is shared with other runners and applications, not a separate
-/// VRAM pool. Reserve headroom, including the source mapping during loading.
-pub(super) fn admit(required: u64, source: u64, budget: Option<u64>) -> Result<()> {
+/// VRAM pool. `required` is the resident set: the weight copy, KV, scratch and
+/// the loader's fixed margin. The safetensors/GGUF mapping is file cache and
+/// is already counted as reclaimable by the host sample.
+pub(super) fn admit(required: u64, budget: Option<u64>) -> Result<()> {
     let host = paddock_engine::host_memory::sample()
         .ok_or_else(|| MetalError::Memory("cannot read physical memory availability".into()))?;
     let available = host.available.saturating_sub(1 << 30);
-    paddock_engine::host_memory::check(required, available, budget).map_err(MetalError::Memory)?;
-    paddock_engine::host_memory::check(required.saturating_add(source), available, None)
-        .map_err(MetalError::Memory)
+    paddock_engine::host_memory::check(required, available, budget).map_err(MetalError::Memory)
 }
 
 #[cfg(test)]

@@ -1365,7 +1365,7 @@ kv_default = "fp8_e4m3"
   # at 32 - the field carries the width the runner defaults to, so narrow
   # envelopes are over-stated by ~2 GiB, which is the safe direction.
   workspace = 6070491580
-  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision", "drafter"], note = "Native Metal 26B-A4B Q8, own BF16 tower and shared-KV assistant. At 4K: 29/29 first tokens, 15/16 short text/image streams including MTP; one image formatting mismatch remains. Testing notes: broader generation, performance and exact Metal manager admission are open. Native context 32768/batch 64 are implementation ceilings, not qualified capacities." } } }
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision", "drafter"], memory = { weight_bytes = 27645605376, source = "measured", max_ctx = 32768, max_batch = 64, full_paged_kv = false, kv_reserve_sequences = 0, workspace_bytes = 0 }, note = "Native Metal 26B-A4B Q8, own BF16 tower and shared-KV assistant. At 4K: 29/29 first tokens, 15/16 short text/image streams including MTP; one image formatting mismatch remains. Testing notes: broader generation, performance and exact Metal manager admission are open. Native context 32768/batch 64 are implementation ceilings, not qualified capacities." } } }
 
   [model.artifact.shape]
   # the measured 27645605376 less the raw Q8_0 embedding table a tied file

@@ -45,6 +45,11 @@ impl Desktop {
             runner_bin: bundled_runner(),
             ..Config::default()
         };
+        // Admission refuses a start before any runner process exists, so the
+        // refusal has to land in the manager log. The CLI installs this tee;
+        // the embedded core is the same manager.
+        let manager_log = Config::data_dir().join("logs").join("manager.log");
+        paddock_admin::logging::init(Some(&manager_log));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("paddock-core")

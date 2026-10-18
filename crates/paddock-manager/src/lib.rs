@@ -21,6 +21,7 @@ pub mod elections;
 pub mod estimate;
 pub mod feedback;
 pub mod forensics;
+mod gemma_metal;
 pub mod graph;
 pub mod hostmem;
 pub mod inspect;
